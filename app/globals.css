@@ -1,0 +1,109 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/**
+ * Design tokens. Every color in the app resolves through one of these, so
+ * light/dark parity is guaranteed by construction rather than by convention.
+ * Values are space-separated RGB channels so Tailwind's <alpha-value> works.
+ */
+@layer base {
+  :root {
+    --font-sans: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+    --font-mono: ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, monospace;
+
+    --surface: 255 255 255;
+    --surface-raised: 255 255 255;
+    --surface-sunken: 244 245 247;
+    --edge: 228 230 235;
+    --edge-strong: 203 207 214;
+    --content: 17 20 24;
+    --content-muted: 90 97 108;
+    --content-subtle: 130 137 148;
+    --brand: 37 99 235;
+    --brand-hover: 29 78 216;
+    --brand-muted: 219 234 254;
+    --yes: 21 128 61;
+    --yes-soft: 220 244 228;
+    --no: 190 24 60;
+    --no-soft: 253 226 233;
+    --warn: 180 83 9;
+  }
+
+  .dark {
+    --surface: 13 15 18;
+    --surface-raised: 22 25 30;
+    --surface-sunken: 17 20 24;
+    --edge: 38 43 51;
+    --edge-strong: 55 62 72;
+    --content: 237 240 244;
+    --content-muted: 156 164 176;
+    --content-subtle: 118 126 138;
+    --brand: 96 165 250;
+    --brand-hover: 147 197 253;
+    --brand-muted: 30 47 77;
+    --yes: 74 222 128;
+    --yes-soft: 20 45 32;
+    --no: 251 113 133;
+    --no-soft: 60 20 30;
+    --warn: 251 191 36;
+  }
+
+  * {
+    border-color: rgb(var(--edge));
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    background-color: rgb(var(--surface));
+    color: rgb(var(--content));
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Visible, consistent focus ring for keyboard users on every interactive element. */
+  :focus-visible {
+    outline: 2px solid rgb(var(--brand));
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  /* Respect reduced-motion: disable all animation/transition. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+@layer utilities {
+  /* Horizontal scroller for the featured slider: hide the bar, keep the scroll. */
+  .no-scrollbar {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  /* Screen-reader-only text that stays focusable for skip links. */
+  .sr-only-focusable:not(:focus):not(:focus-within) {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border-width: 0;
+  }
+}

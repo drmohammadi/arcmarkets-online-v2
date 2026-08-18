@@ -1,0 +1,15 @@
+
+  {
+    "5042002": {
+      "chainId": 5042002,
+      "network": "arcTestnet",
+      "collateralToken": "0xFfbB270E10a8139CdeA08F361e0067d56e8643ce",
+      "isMockUSDC": true,
+      "conditionalTokens": "0x14252160c567088BAA00D8A921b508040Cd66eFf",
+      "marketFactory": "0x5277062A9Fc026f7AB50a2f2c2E491A829356037",
+      "marketMetadata": "0xFBE32A693Fd8BfBF13B7E97207A2A046Fb0aC869",
+      "social": "0xc1BcaD82134A022A8F8636072438b6Fa5a95f2dc",
+      "startBlock": 55632013,
+      "deployer": ""
+    }
+  }
