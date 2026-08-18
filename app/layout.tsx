@@ -5,7 +5,7 @@ import { Footer } from '@/components/Footer';
 
 export const metadata: Metadata = {
   title: 'Arc Markets — Prediction Markets on Arc',
-  description: 'Trade binary prediction markets settled in USDC on Circle Arc L1.',
+  description: 'Trade binary prediction markets settled in USDC on Circle Arc L1. Built by Fabio on Arc',
 };
 
 /**
