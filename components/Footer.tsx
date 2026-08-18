@@ -58,7 +58,7 @@ export function Footer() {
             &copy; {year} {SITE.name}. Not investment advice.
           </p>
           <p>
-            Testnet build — markets settle in test USDC and carry no monetary value.
+            Testnet build markets settle in test USDC and carry no monetary value.
           </p>
         </div>
       </div>
