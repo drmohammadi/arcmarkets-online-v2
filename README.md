@@ -188,5 +188,5 @@ arc-prediction-market/
 ## License
 
 MIT — see LICENSE file.
-```
+
 Built by Fabio.
