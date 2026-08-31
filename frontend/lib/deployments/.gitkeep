@@ -1,0 +1,2 @@
+# Deployment artifacts are written here by contracts/scripts/deploy.ts
+# Files: <chainId>.json (e.g. 5042002.json for Arc testnet, 31337.json for local)

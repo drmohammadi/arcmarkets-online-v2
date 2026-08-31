@@ -1,0 +1,17 @@
+node_modules/
+.env
+.env.local
+
+contracts/artifacts/
+contracts/cache/
+contracts/typechain-types/
+contracts/coverage/
+contracts/coverage.json
+contracts/deployments/*.local.json
+
+frontend/.next/
+frontend/out/
+frontend/node_modules/
+frontend/tsconfig.tsbuildinfo
+
+*.log

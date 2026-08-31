@@ -1,0 +1,322 @@
+I want to implement the blockchain indexer and PostgreSQL architecture for 0xOutcome, but **I do NOT want to use or manage a VPS**.
+
+The current frontend is deployed on Vercel, and I want to keep it there.
+
+Please redesign the architecture using managed/serverless infrastructure only.
+
+### Required architecture
+
+```text
+Arc Blockchain
+      ↓
+Arc RPC
+      ↓
+Serverless Worker / Scheduled Job
+      ↓
+Managed PostgreSQL
+      ↓
+Backend API
+      ↓
+Vercel Frontend
+      ↓
+Price Chart
+```
+
+### Infrastructure requirements
+
+Do NOT require a VPS, dedicated server, or manually managed Linux server.
+
+Evaluate and use the most practical managed options, for example:
+
+* Supabase PostgreSQL
+* Neon PostgreSQL
+* Vercel-compatible serverless functions
+* Cloudflare Workers
+* Trigger.dev
+* Inngest
+* Other reliable serverless/managed worker solutions if appropriate
+
+Do not blindly choose one. First determine which option is actually suitable for a blockchain indexer that needs to:
+
+* Perform an initial ~1.7M block historical backfill
+* Process RPC requests in batches
+* Handle Arc RPC range limitations
+* Handle HTTP 429 rate limits
+* Resume after failures
+* Continuously index new blocks
+* Store progress/checkpoints
+* Avoid duplicate events
+* Run without a VPS
+
+### Important: long-running indexer
+
+I understand that Vercel serverless functions are not suitable for a permanently running process.
+
+Therefore, do NOT try to keep a serverless function alive indefinitely.
+
+Instead, design the indexer as resumable jobs:
+
+```text
+Scheduled Job
+      ↓
+Read last indexed block from PostgreSQL
+      ↓
+Process a limited block range
+      ↓
+Store events
+      ↓
+Update checkpoint
+      ↓
+Exit
+```
+
+Then the next scheduled execution continues from the checkpoint.
+
+For example:
+
+```text
+Run 1 → blocks A-B
+Run 2 → blocks B-C
+Run 3 → blocks C-D
+...
+```
+
+After the historical backfill reaches the chain head, the same system should periodically process new blocks.
+
+If a better managed/serverless architecture exists, use it, but it must not require a VPS.
+
+### Data to index
+
+Index these:
+
+1. MarketFactory.MarketCreated
+2. MarketFactory.MarketResolved
+3. FixedProductMarketMaker.Buy
+4. FixedProductMarketMaker.Sell
+5. FixedProductMarketMaker.LiquidityAdded
+6. FixedProductMarketMaker.LiquidityRemoved
+7. Block timestamps
+
+Do NOT index Social.sol comments/usernames or MarketMetadata unless you find a specific technical reason that they are required.
+
+### Price correctness
+
+Fix the price issue discovered during the code review.
+
+The current historical Buy/Sell points represent execution prices, while the final/current point represents the pool's marginal price.
+
+Do not reproduce this inconsistency.
+
+Store the raw event fields required to calculate prices correctly, including the market fee.
+
+Determine the correct price representation for the chart based on the existing 0xOutcome contract logic.
+
+If necessary, support both:
+
+* execution price
+* marginal/current price
+
+but make the frontend chart use one consistent definition.
+
+### PostgreSQL
+
+Use a managed PostgreSQL service.
+
+Design the schema for:
+
+* markets
+* market price history
+* liquidity events
+* indexed blocks/checkpoints
+* block timestamps
+
+Use proper indexes and unique constraints.
+
+The indexer must be idempotent, so running the same job twice must not create duplicate events.
+
+### Backfill
+
+The historical range is approximately:
+
+```text
+55,632,013 → 57,300,000+
+```
+
+Do NOT scan this entire range in one RPC request.
+
+Automatically determine a safe chunk size based on Arc RPC limitations.
+
+Handle:
+
+* HTTP 429
+* RPC errors
+* temporary failures
+* range-limit errors
+* retries with exponential backoff
+* adaptive chunk sizing if necessary
+
+The backfill must be resumable.
+
+If the job stops at block X, the next execution must continue from X rather than starting over.
+
+### Continuous indexing
+
+After backfill:
+
+```text
+Scheduler
+   ↓
+Read latest indexed block
+   ↓
+Read new blockchain events
+   ↓
+Insert into PostgreSQL
+   ↓
+Update checkpoint
+```
+
+The system should continuously stay close to the Arc chain head.
+
+Do not make the frontend responsible for indexing.
+
+### Block timestamps
+
+Do not make the browser call getBlock for every event.
+
+The indexer should obtain block timestamps server-side and cache them in PostgreSQL.
+
+If multiple events belong to the same block, fetch the block timestamp only once.
+
+### API
+
+Create an API endpoint such as:
+
+```text
+GET /api/markets/:marketId/chart
+```
+
+Support:
+
+* outcome
+* from
+* to
+* interval
+* limit
+
+Example:
+
+```text
+/api/markets/123/chart?outcome=0&from=24h&interval=5m
+```
+
+The frontend must get historical chart data from PostgreSQL through the API.
+
+The frontend must NOT scan blockchain logs for historical chart data anymore.
+
+### Performance goal
+
+The current flow is:
+
+```text
+Frontend → RPC → scan ~1.7M blocks → chart
+```
+
+The new flow should be:
+
+```text
+Frontend → API → PostgreSQL → chart
+```
+
+The frontend should require little or no RPC access for historical chart data.
+
+### Cost
+
+Before implementation, compare the realistic monthly cost of:
+
+* Supabase
+* Neon
+* Vercel
+* Cloudflare Workers
+* Trigger.dev
+* Inngest
+* Any other suitable managed option
+
+Prioritize:
+
+1. Free/very-low-cost tier if realistically sufficient
+2. Reliability
+3. Easy deployment
+4. No VPS
+5. Ability to perform the initial backfill
+6. Ability to continuously index
+7. Minimal maintenance
+
+Do not choose a service simply because it has a free tier if its execution limits make the architecture unreliable.
+
+### Local testing
+
+Because Arc Testnet RPC may not be accessible from your current environment, the implementation must be testable locally.
+
+Create a local Hardhat test scenario with synthetic:
+
+* MarketCreated
+* Buy
+* Sell
+* LiquidityAdded
+* LiquidityRemoved
+* MarketResolved
+
+events.
+
+Verify that:
+
+```text
+Blockchain events
+       ↓
+Indexer
+       ↓
+PostgreSQL
+       ↓
+Chart API
+```
+
+produces the expected data.
+
+### Deployment
+
+After implementation, provide exact deployment instructions for the chosen managed services.
+
+Include:
+
+* Environment variables
+* Database setup
+* Database migrations
+* Worker/job deployment
+* Scheduler configuration
+* Initial backfill command/job
+* Continuous indexing configuration
+* How to monitor indexer health
+* How to restart/resume indexing
+* How to migrate/recover the database
+
+### Very important
+
+Do not add unnecessary infrastructure.
+
+I specifically want to avoid:
+
+* VPS
+* Dedicated server
+* Docker server that I have to maintain
+* Kubernetes
+* Redis unless absolutely necessary
+
+Use managed/serverless infrastructure wherever possible.
+
+Before implementing, first inspect the existing 0xOutcome project and then give me the recommended architecture and exact services you will use.
+
+Do not implement a VPS-based solution.
+
+The final objective is:
+
+**Fast chart loading + dramatically fewer RPC requests + no VPS management + reliable historical indexing + continuous indexing of new blocks.**

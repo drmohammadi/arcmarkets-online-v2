@@ -1,0 +1,48 @@
+Paste your prompt below this line, save the file, then tell me "read prompt.txt".
+Everything below the line is treated as your instructions.
+------------------------------------------------------------------------------
+
+yes ,One more important requirement:
+
+
+
+I want the indexer to be triggered whenever a user opens the website/chart, so that user traffic can help keep the index up to date.
+
+
+
+I understand that a Vercel Cron Job itself cannot literally run on every page view because Cron is schedule-based. Therefore, use the appropriate Vercel/Next.js background mechanism (such as after() or another suitable approach) to trigger an indexing/catch-up job whenever a user request detects that the index is stale.
+
+
+
+The behavior should be:
+
+User opens website/chart
+        ↓
+Check indexer checkpoint
+        ↓
+If index is stale
+        ↓
+Trigger background indexing job
+        ↓
+Immediately return the latest available chart data
+        ↓
+Background job indexes new blocks
+        ↓
+Next user gets the updated data
+
+
+Important:
+
+
+
+Never make the user wait for indexing.
+
+Never run a full historical scan because of a user request.
+
+Only process from last_indexed_block forward.
+
+Make the job idempotent so multiple users opening the site simultaneously cannot create duplicate data or cause conflicting indexing jobs.
+
+If multiple users trigger the job at the same time, use a database-based lock/advisory lock or another reliable locking mechanism so only one indexing process runs at a time.
+
+Vercel Cron should still be used as a periodic backup/safety mechanism, but user traffic should also be able to trigger catch-up when the index is stale.

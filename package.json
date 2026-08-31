@@ -1,0 +1,27 @@
+{
+  "name": "arc-prediction-market",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Polymarket-style on-chain prediction market on Circle's Arc L1 (testnet 5042002, mainnet-ready).",
+  "workspaces": [
+    "contracts",
+    "frontend"
+  ],
+  "scripts": {
+    "test": "npm --workspace contracts run test",
+    "coverage": "npm --workspace contracts run coverage",
+    "compile": "npm --workspace contracts run compile",
+    "node": "npm --workspace contracts run node",
+    "deploy:local": "npm --workspace contracts run deploy:local",
+    "deploy:testnet": "npm --workspace contracts run deploy:testnet",
+    "deploy:metadata:local": "npm --workspace contracts run deploy:metadata:local",
+    "deploy:metadata:testnet": "npm --workspace contracts run deploy:metadata:testnet",
+    "deploy:social:local": "npm --workspace contracts run deploy:social:local",
+    "deploy:social:testnet": "npm --workspace contracts run deploy:social:testnet",
+    "dev": "npm --workspace frontend run dev",
+    "discover:startblock:testnet": "npm --workspace contracts run discover:startblock:testnet"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
