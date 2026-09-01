@@ -23,8 +23,19 @@
  *    opposite — the request was fine, there were too many of them, and splitting
  *    it into two makes things worse at the exact moment the endpoint asked for
  *    less traffic. Conflating the two is how the old chart burned its whole
- *    per-load request budget without advancing. `isRateLimit` here mirrors
- *    `lib/rpcQueue.ts:76-92` so the two never disagree about what a 429 is.
+ *    per-load request budget without advancing. Because the two predicates below
+ *    can both fire on one message, `classifyRpcError` — not the booleans — is the
+ *    entry point callers should use; it fixes the precedence once, here.
+ *
+ *    `isRateLimit` is a strict SUPERSET of `lib/rpcQueue.ts:76-92`, not a mirror
+ *    of it: it also accepts a bare string, reads `statusCode`/`shortMessage`/
+ *    `details`, and walks `error` as well as `cause`. So the indexer can back off
+ *    where the browser will not — intended, since a missed 429 in a long
+ *    server-side sweep is far more costly than one extra pause. The drift risk is
+ *    ONE-DIRECTIONAL and unfixable by design: `rpcQueue`'s ladder and predicate
+ *    are non-exported module state, and the zero-import rule forbids reading
+ *    them, so a change on THAT side breaks no test here. Changing `rpcQueue`
+ *    means changing this file by hand.
  *
  * 2. **The learned ceiling only ever RISES.** `lib/logCache.ts:220-241` paid for
  *    this: `eth_getLogs` can be refused for RESULT COUNT as well as for range
@@ -56,11 +67,32 @@ const TWO = BigInt(2);
 /**
  * Backoff ladder for rate limits, in ms; its length also caps the retry count.
  *
- * Kept numerically identical to `lib/rpcQueue.ts:46`. The browser and the
- * indexer talk to the same endpoint, so a different ladder here would mean two
- * components disagreeing about how hard to push the same rate limit.
+ * Numerically identical to `lib/rpcQueue.ts:46` — copied, not shared, because
+ * this module may not import. That copy can only drift in one direction: the
+ * ladder there is a non-exported `const`, so the test that pins these four
+ * numbers cannot notice a change made on that side. Edit both together.
  */
 export const BACKOFF_MS: readonly number[] = [1000, 2000, 4000, 8000];
+
+/**
+ * Smallest chunk width any policy here will hand back: 1000 blocks, the same
+ * floor as `logScan.ts:193`'s `minChunk` default, so there is ONE floor in the
+ * codebase rather than one per module.
+ *
+ * A floor is not politeness, it is the difference between a backfill that
+ * finishes and one that never does. Every caller uses a ceiling as a loop STEP,
+ * and the fold in `nextChunkCeiling` only ever raises — so a ceiling of 1 block
+ * can only rise if some caller probes ABOVE its own ceiling. A caller that
+ * simply steps by it requests one block, succeeds, re-learns 1, and covers
+ * `maxRequests` blocks per run against a 1.7M-block history: the silent,
+ * progressive emptiness `CLAUDE.md` warns about twice.
+ *
+ * `logCache.ts:231-232` avoids the same trap differently — it declines to store
+ * a non-positive value at all, leaving the ceiling UNKNOWN so the next sweep
+ * uses its own default. A non-nullable `bigint` return cannot express "unknown",
+ * so a stated floor is the closest faithful equivalent.
+ */
+export const MIN_CHUNK: bigint = BigInt(1000);
 
 /**
  * How many `cause`/`error` links to follow.
@@ -138,39 +170,63 @@ function chainHas(err: unknown, test: (e: unknown) => boolean, depth = 0): boole
 /**
  * Detect "your block range is too wide / returned too many results".
  *
- * MUST be disjoint from `isRateLimit` for the values either one recognizes: the
- * only useful response to this is a NARROWER range, and the only useful response
- * to a 429 is a LATER request. A caller that gets both wrong at once retries the
- * same refused range until its budget is gone.
+ * Read this as a REMEDY class, not as a wire message: everything it matches is
+ * fixed by asking for FEWER BLOCKS. `query timeout exceeded` is here for that
+ * reason — the endpoint did not refuse the shape of the query, it failed to serve
+ * the WIDTH of it, and a narrower range is the only thing that helps. (Nothing in
+ * the ladder above will: waiting re-runs the same expensive query.) The accurate
+ * name would be `shouldNarrowRange`; the name is fixed by the interface Task 5
+ * consumes, so the meaning lives in this comment instead.
  *
- * Broad on substrings because endpoints word this differently (`-32012` on Arc,
- * "query returned more than N results" on others) and a missed range refusal
- * means the sweep stops at its first dense chunk instead of subdividing.
+ * Deliberately broad on substrings because endpoints word the cap differently
+ * (`-32012` on Arc, "query returned more than N results" on Infura, "Log
+ * response size exceeded … up to a 500 block range" on Alchemy) and a MISSED
+ * range refusal stops the sweep dead at its first dense chunk instead of
+ * subdividing it.
+ *
+ * Not disjoint from `isRateLimit` for every input, and it cannot be made so
+ * without narrowing one of them: `{code: -32005, message: "query returned more
+ * than 10000 results"}` is a real Alchemy/Infura shape that satisfies both. That
+ * is what `classifyRpcError` exists to settle — use it rather than calling these
+ * two in an order you have to remember.
  */
 export function isRangeTooLarge(err: unknown): boolean {
   return chainHas(err, (e) => {
-    // -32012 is Arc's; -32701 is seen from some Geth-family gateways.
-    if (hasCode(e, [-32012, -32701])) return true;
+    // -32012 is Arc's. No other code is listed: the `-32701` this file used to
+    // accept has no basis in Geth's or Arc's documented error sets, so it was
+    // dropped rather than left as folklore.
+    if (hasCode(e, [-32012])) return true;
     const msg = messageOf(e);
     if (!msg) return false;
+    // `requested range` used to be in this list and was removed: Arc's own
+    // message already matches `range too large`, so its only unique catches were
+    // "requested range start is before the pruned block"-style errors — pointless
+    // halving with no compensating detection.
     return (
       msg.includes('range too large') ||
       msg.includes('range is too large') ||
       msg.includes('range too wide') ||
-      msg.includes('requested range') ||
       msg.includes('too many blocks') ||
       msg.includes('returned more than') ||
       msg.includes('response size exceeded') ||
       msg.includes('query timeout exceeded') ||
+      // Kept knowingly loose: Alchemy/QuickNode state the cap as "up to a 500
+      // block range", which none of the phrases above catch. It also matches
+      // pruned-node and malformed-parameter wording ("invalid block range"),
+      // where halving cannot help — but that costs a BOUNDED handful of requests
+      // (log2 of the span down to MIN_CHUNK) before the chunk is reported failed,
+      // whereas a missed cap stalls the whole sweep. Accepted with eyes open.
       msg.includes('block range')
     );
   });
 }
 
 /**
- * Detect a rate-limit rejection. Kept behaviourally identical to
- * `lib/rpcQueue.ts:76-92`, extended only to accept a bare string and to walk a
- * bounded chain, so the indexer and the browser back off on the same signals.
+ * Detect a rate-limit rejection: the request was fine, there were too many.
+ *
+ * A strict superset of `lib/rpcQueue.ts:76-92` (bare strings, `statusCode`,
+ * viem's `shortMessage`/`details`, the `error` link) — see rule 1 at the top for
+ * why one-way divergence is intended and why no test can catch it.
  *
  * Note what is NOT here: nothing about ranges or result counts. -32005 ("limit
  * exceeded") is a request-rate signal; a range refusal reports -32012 instead.
@@ -181,12 +237,41 @@ export function isRateLimit(err: unknown): boolean {
     const msg = messageOf(e);
     if (!msg) return false;
     return (
-      msg.includes('429') ||
+      // WORD BOUNDARY, not a substring. `msg.includes('429')` classified
+      // "requested range too large: 55429000..55700000" as a rate limit, so the
+      // caller retried an unchanged range forever — the exact infinite loop this
+      // whole split exists to prevent, defeated by three digits inside a block
+      // number. Digits are word characters, so `\b429\b` cannot match 55429000
+      // while still matching "HTTP 429", "status=429," and a lone "429".
+      /\b429\b/.test(msg) ||
       msg.includes('too many requests') ||
       msg.includes('rate limit') ||
       msg.includes('limit exceeded')
     );
   });
+}
+
+/**
+ * THE ENTRY POINT for error handling in the indexer (Task 5 and later). Prefer
+ * this to the two predicates: it is where the precedence between them is fixed,
+ * so no call site can get the order wrong.
+ *
+ * Range-too-large is tested FIRST, and that order is not arbitrary — it is the
+ * cost asymmetry of being wrong:
+ *  - a 429 misread as a range refusal costs ONE wasted halving, and the narrower
+ *    request usually succeeds anyway (it is also less load, which is what the
+ *    endpoint asked for);
+ *  - a range refusal misread as a 429 costs THE ENTIRE REQUEST BUDGET, because
+ *    every retry re-sends a range that will be refused for as long as it is that
+ *    wide, and the run ends having covered nothing.
+ * Bounded waste versus unbounded waste, so ties go to range-too-large.
+ *
+ * Total, like the predicates it delegates to: never throws, whatever it is given.
+ */
+export function classifyRpcError(err: unknown): 'range-too-large' | 'rate-limit' | 'other' {
+  if (isRangeTooLarge(err)) return 'range-too-large';
+  if (isRateLimit(err)) return 'rate-limit';
+  return 'other';
 }
 
 /**
@@ -200,6 +285,12 @@ export function isRateLimit(err: unknown): boolean {
  *
  * Floor division matches the halving in `lib/logScan.ts:263`, so an odd span
  * yields a slightly smaller lower half rather than overshooting.
+ *
+ * `minChunk` is honoured AS GIVEN (clamped only at one block), not raised to
+ * `MIN_CHUNK`: this is a per-call floor the caller states explicitly — exactly
+ * like `logScan`'s `minChunk` option, whose default happens to be `MIN_CHUNK` —
+ * and silently overriding it would make `halve(span, 1)` a lie. The `MIN_CHUNK`
+ * floor guards the values this module INVENTS, not the ones it is handed.
  */
 export function halve(span: bigint, minChunk: bigint): bigint | null {
   if (span <= ONE) return null;
@@ -214,18 +305,23 @@ export function halve(span: bigint, minChunk: bigint): bigint | null {
  * ever raises (see rule 2 at the top of this file, and `logCache.ts:220-241`).
  *
  * `accepted` is expected to be a span the endpoint actually served at full
- * requested size. A non-positive value carries no information, so it is ignored;
- * with no prior ceiling that leaves ONE, because every caller uses the result as
- * a loop step and a zero step is an infinite loop issuing invalid queries — the
- * same clamp as `logScan.ts:213`.
+ * requested size. A non-positive value is NO INFORMATION, not evidence of a small
+ * limit: `current` is returned untouched when there is one, and `MIN_CHUNK` when
+ * there is not. The result never goes below `MIN_CHUNK` — see that constant for
+ * why returning `BigInt(1)` here was a ratchet lock that let a backfill cover
+ * `maxRequests` blocks per run, and why `logCache.ts:231-232` expresses the same
+ * rule by storing nothing at all.
  */
 export function nextChunkCeiling(current: bigint | null, accepted: bigint): bigint {
-  if (accepted <= ZERO) {
-    if (current === null) return ONE;
-    return current > ZERO ? current : ONE;
-  }
-  if (current === null || current < accepted) return accepted;
-  return current;
+  const raised =
+    accepted <= ZERO
+      ? current === null
+        ? MIN_CHUNK
+        : current
+      : current === null || current < accepted
+        ? accepted
+        : current;
+  return raised < MIN_CHUNK ? MIN_CHUNK : raised;
 }
 
 /**
@@ -244,9 +340,18 @@ export function nextChunkCeiling(current: bigint | null, accepted: bigint): bigi
  *    `last.to + 1`, which is why stopping short must never be disguised as
  *    completion (`budgetStopped` vs `incomplete` in `logScan.ts:126-162`).
  *
- * `chunk` is clamped to at least one block for the loop-step reason above, and a
- * negative `from` is clamped to block 0; both are impossible inputs on-chain, and
- * silently correcting them beats emitting a plan no node will answer.
+ * `chunk` is clamped up to `MIN_CHUNK` if it is non-positive — a zero or negative
+ * step is an infinite loop issuing invalid queries, and one block per request is
+ * technically a step but not a usable one (see `MIN_CHUNK`). A negative `from` is
+ * clamped to block 0. Both are impossible inputs on-chain, and silently
+ * correcting them beats emitting a plan no node will answer.
+ *
+ * `maxRequests` of `Infinity` means UNCAPPED, and yields the whole sweep. It used
+ * to yield `[]`, which turned the most plausible reading of that sentinel into
+ * zero coverage reported as a finished plan. `NaN` and `-Infinity` still yield
+ * `[]`: unlike `+Infinity` they carry no plausible intent, and there is no honest
+ * plan for "budget unknown". Uncapped means the caller owns the size of the
+ * result — a span of S blocks materialises S/chunk entries.
  */
 export function planRanges(
   from: bigint,
@@ -255,13 +360,15 @@ export function planRanges(
   maxRequests: number
 ): BlockRange[] {
   const out: BlockRange[] = [];
-  if (!Number.isFinite(maxRequests) || maxRequests < 1) return out;
+  const uncapped = maxRequests === Infinity;
+  if (!uncapped && (!Number.isFinite(maxRequests) || maxRequests < 1)) return out;
 
   const start = from < ZERO ? ZERO : from;
   if (to < start) return out;
 
-  const step = chunk > ZERO ? chunk : ONE;
-  const cap = Math.floor(maxRequests);
+  const step = chunk > ZERO ? chunk : MIN_CHUNK;
+  // A request COUNT, never a block number or a span — no precision to lose here.
+  const cap = uncapped ? Infinity : Math.floor(maxRequests);
 
   let cursor = start;
   while (cursor <= to && out.length < cap) {
