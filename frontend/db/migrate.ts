@@ -31,6 +31,9 @@ const dir = join(here, 'migrations');
  */
 const MIGRATION_LOCK_KEY = '5042002001';
 
+/** Wait this long for the lock, then fail loudly rather than hang a deploy. */
+const LOCK_TIMEOUT = '5s';
+
 /**
  * Minimal KEY=VALUE reader. Skips blanks and `#` comments, splits on the FIRST
  * `=` (values contain `=` — a Postgres URL with query params does), and strips
@@ -84,6 +87,53 @@ function describeTarget(connectionString: string): string {
   }
 }
 
+/**
+ * Runs `body` in a transaction that first takes the migration lock.
+ *
+ * The lock is TRANSACTION-scoped (`pg_advisory_xact_lock`), which is the only
+ * variant that works here: `DATABASE_URL` points at Neon's `-pooler` endpoint,
+ * i.e. PgBouncer in transaction mode. There, two runners can be multiplexed
+ * onto the SAME backend session, and a *session* lock (`pg_advisory_lock`) on
+ * the same key would then be a recursive re-acquire that succeeds instantly and
+ * serializes nothing — protection in appearance only. PgBouncer does pin a
+ * server connection for the duration of a transaction, so a transaction-scoped
+ * lock is genuinely exclusive, and it is released by COMMIT/ROLLBACK rather than
+ * by session teardown.
+ *
+ * Contrast with `lib/db/queries.ts` (a later task), which uses a lease ROW: a
+ * serverless function can be killed mid-run, and a killed function releases no
+ * lock of any scope, whereas a lease simply expires. Do not unify the two —
+ * each is wrong in the other's setting.
+ *
+ * `lock_timeout` is set transaction-locally (`set_config(..., true)`) rather
+ * than as a session GUC, for the same pooling reason: a session-level SET may
+ * land on a backend that does not serve the next transaction. Local means it is
+ * always in force on the backend that will actually do the waiting, so a wedged
+ * holder fails a parallel deploy fast (Postgres 55P03) instead of hanging.
+ */
+async function inLockedTransaction<T>(client: Client, body: () => Promise<T>): Promise<T> {
+  await client.query('BEGIN');
+  try {
+    await client.query('SELECT set_config($1, $2, true)', ['lock_timeout', LOCK_TIMEOUT]);
+    await client.query('SELECT pg_advisory_xact_lock($1)', [MIGRATION_LOCK_KEY]);
+    const result = await body();
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    // Guarded: the likeliest mid-migration failure is a dropped connection, and
+    // then ROLLBACK rejects too. An unguarded rollback would let that secondary
+    // rejection replace the error an operator actually needs to see. Postgres
+    // discards an aborted transaction — and its xact lock — on disconnect
+    // anyway, so a failed rollback costs nothing but a log line.
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackErr) {
+      console.error('rollback also failed (original error follows):', rollbackErr);
+    }
+    throw err;
+  }
+}
+
 async function main(): Promise<void> {
   const connectionString = resolveDatabaseUrl();
   if (!connectionString) {
@@ -94,73 +144,63 @@ async function main(): Promise<void> {
   await client.connect();
   console.log(`connected to ${describeTarget(connectionString)}`);
   try {
-    await client.query(
-      'CREATE TABLE IF NOT EXISTS schema_migrations (filename text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())'
+    // The bootstrap needs the lock too. Two concurrent `CREATE TABLE IF NOT
+    // EXISTS` can collide in the catalog and fail with a unique violation on
+    // pg_type_typname_nsp_index — on a fresh database that is exactly the
+    // deploy failure this lock exists to prevent.
+    await inLockedTransaction(client, () =>
+      client.query(
+        'CREATE TABLE IF NOT EXISTS schema_migrations (filename text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())'
+      )
     );
 
-    // Serialize the WHOLE check-then-apply sequence, not just the insert:
-    // `db:migrate` is a build step, and parallel deploys are normal, so two
-    // runners can otherwise both pass the `done` check below and the loser's
-    // INSERT fails the deploy on the filename primary key.
-    //
-    // A SESSION-level advisory lock is right *here* and wrong elsewhere in this
-    // project. lib/db/queries.ts uses a lease ROW instead, because it runs on
-    // serverless functions behind a transaction-mode pooler: no session
-    // affinity, and a killed function would never release a session lock.
-    // migrate.ts is a one-shot CLI holding a single dedicated Client for its
-    // entire life, which is exactly the case this lock fits. Do not unify the
-    // two mechanisms — each is wrong in the other's setting.
-    await client.query('SELECT pg_advisory_lock($1)', [MIGRATION_LOCK_KEY]);
-
-    const done = new Set(
-      (
-        await client.query<{ filename: string }>('SELECT filename FROM schema_migrations')
-      ).rows.map((r) => r.filename)
-    );
     const files = readdirSync(dir)
       .filter((f) => f.endsWith('.sql'))
       .sort();
     for (const file of files) {
-      if (done.has(file)) {
-        console.log(`skip ${file}`);
-        continue;
-      }
-      const sql = readFileSync(join(dir, file), 'utf8');
-      await client.query('BEGIN');
-      try {
+      // One transaction per file, each holding the lock, each carrying its own
+      // INSERT — so a failed migration leaves no record, and check-then-apply
+      // is serialized as a whole rather than only at the insert.
+      await inLockedTransaction(client, async () => {
+        // Re-read inside the lock. A read taken before acquiring it could have
+        // been overtaken by a runner that has since committed this very file.
+        const done = new Set(
+          (
+            await client.query<{ filename: string }>('SELECT filename FROM schema_migrations')
+          ).rows.map((r) => r.filename)
+        );
+        if (done.has(file)) {
+          console.log(`skip ${file}`);
+          return;
+        }
+        const sql = readFileSync(join(dir, file), 'utf8');
         await client.query(sql);
-        // ON CONFLICT is a second line of defence behind the advisory lock, so
-        // correctness does not rest on the lock alone: a runner that somehow
-        // raced past it records nothing rather than aborting the deploy.
-        await client.query(
+        // ON CONFLICT is independent defence behind the lock, so correctness
+        // does not rest on the lock alone: a runner that somehow raced past it
+        // records nothing rather than aborting the deploy. rowCount tells us
+        // which of those two actually happened, so the log cannot claim an
+        // insert that did not occur.
+        const insert = await client.query(
           'INSERT INTO schema_migrations (filename) VALUES ($1) ON CONFLICT (filename) DO NOTHING',
           [file]
         );
-        await client.query('COMMIT');
-        console.log(`applied ${file}`);
-      } catch (err) {
-        // Guarded: the likeliest mid-migration failure is a dropped connection,
-        // and then ROLLBACK rejects too. An unguarded rollback would let that
-        // secondary rejection replace the error an operator actually needs to
-        // see. Postgres discards an aborted transaction on disconnect anyway,
-        // so a failed rollback costs nothing but a log line.
-        try {
-          await client.query('ROLLBACK');
-        } catch (rollbackErr) {
-          console.error('rollback also failed (original error follows):', rollbackErr);
-        }
-        throw err;
-      }
+        console.log(
+          (insert.rowCount ?? 0) > 0
+            ? `applied ${file}`
+            : `applied ${file} (record already present — no row written)`
+        );
+      });
     }
   } finally {
-    // Releasing the lock is belt-and-braces: ending the session drops it. Both
-    // are guarded so neither can mask a migration failure on the way out.
+    // Guarded for the same reason as the rollback: an end() rejection must not
+    // displace the error we are already unwinding with. Nothing leaks if it
+    // fails — the xact lock is gone with the transaction, and the socket dies
+    // with the process.
     try {
-      await client.query('SELECT pg_advisory_unlock($1)', [MIGRATION_LOCK_KEY]);
-    } catch {
-      // Nothing to do: the lock dies with the session on the next line.
+      await client.end();
+    } catch (endErr) {
+      console.error('closing the connection failed:', endErr);
     }
-    await client.end();
   }
 }
 
