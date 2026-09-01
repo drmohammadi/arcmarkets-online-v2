@@ -102,7 +102,7 @@ the history, never the right edge of the line.
 | `MarketFactory` | `MarketCreated` | Yields the FPMM address set to watch (pools are deployed via `new`, so addresses are not knowable in advance), `created_block`, and `fee` — which the `Market` struct does not store. Currently never queried by the app. |
 | `MarketFactory` | `MarketResolved` | Marks a market terminal; ends its series honestly. |
 | `FixedProductMarketMaker` | `Buy`, `Sell` | The trades. Primary price source. |
-| `FixedProductMarketMaker` | `LiquidityAdded`, `LiquidityRemoved` | **`removeLiquidity` moves the price with no Buy/Sell emitted** (`FixedProductMarketMaker.sol:149-156` hands residual single-outcome tokens to the LP). Today's chart silently misses that move. |
+| `FixedProductMarketMaker` | `LiquidityAdded`, `LiquidityRemoved` | **The replay of every later `Buy`/`Sell` is wrong without them** — those formulas read the pre-event reserves, and `removeLiquidity` also needs `total_supply`. Separately, `addLiquidity` *does* move the marginal price whenever the pool is unbalanced: it adds an equal amount to unequal reserves (`:103`), pulling the ratio toward 50/50, with no Buy/Sell emitted. Today's chart misses that. `removeLiquidity` scales both reserves by the same factor (`:134-135`) and therefore does **not** move the price. |
 | Block header | `timestamp`, `hash` | Timestamps make a time axis and time-bucketing possible at all; hashes are the reorg witness. Fetched once per block *containing events*, cached forever. |
 
 **Not indexed:** `Social.sol` (usernames, comments) and `MarketMetadata`. Not
@@ -270,9 +270,11 @@ Two indexes beyond primary keys, deliberately — writes must stay cheap.
    rows for zero information. `?outcome=1` flips in the API.
 
 3. **Raw events and replayed prices in one table, not separate
-   `market_price_history` and `liquidity_events` tables.** `removeLiquidity`
-   moves the price, so liquidity events belong *in* the price series. One table
-   means no join on the hot path and one place to truncate on reorg.
+   `market_price_history` and `liquidity_events` tables.** Liquidity events carry
+   a price like any other: `addLiquidity` genuinely moves it on an unbalanced
+   pool, and even when the price is unchanged the row records the reserve
+   magnitudes that every later replay step depends on. One table means no join on
+   the hot path and one place to truncate on reorg.
 
 Raw event fields are preserved in full, so nothing is lost by the merge.
 
@@ -662,8 +664,9 @@ without it.
 1. Deploy the system (reuse `test/helpers.ts` `deploySystem()`).
 2. Create several markets, including a `"Event: Outcome"` pair.
 3. Emit every indexed event: `addLiquidity`, `buy` on both outcomes, `sell`,
-   `removeLiquidity` (deliberately from an **unbalanced** pool, so residual
-   single-outcome tokens move the price with no Buy/Sell), and `resolveMarket`.
+   a **second `addLiquidity` onto the now-unbalanced pool** (which moves the
+   marginal price with no Buy/Sell emitted — the case today's chart misses),
+   `removeLiquidity`, and `resolveMarket`.
 4. Run the indexer module against `http://127.0.0.1:8545` and a test database.
 5. Assert:
    - one row per emitted event, correct `kind`, `outcome`, `collateral`, `shares`
@@ -671,7 +674,10 @@ without it.
      for every pool** — the decisive assertion
    - `yes_bps` equals `yesProbBps(reserves())` at the final state
    - the `removeLiquidity` checksum holds
-   - the price series includes the `removeLiquidity` move
+   - the series shows a price change across the **second `addLiquidity`**, and
+     **no** price change across `removeLiquidity` (proportional withdrawal
+     preserves the ratio) — asserting both directions is what proves the replay
+     models the contract rather than merely producing plausible numbers
    - `block_time` on every event matches the block's on-chain timestamp, and each
      block header was fetched **once** regardless of how many events it carries
    - running the indexer **twice** changes no row count (idempotency)

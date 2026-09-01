@@ -137,9 +137,16 @@ Docker, and no VPS; see the Backend bullet under Architecture.
   records applied filenames in `schema_migrations`)
 - Indexer proof end-to-end, no testnet needed:
   `cd contracts && npx hardhat run scripts/e2e-indexer.ts` — deploys locally, emits every
-  indexed event including a price-moving `removeLiquidity`, indexes it, and asserts the
-  replayed reserves equal on-chain `reserves()` exactly. **This is the decisive test**; run
-  it after any change to the indexer or the replay arithmetic.
+  indexed event including a price-moving second `addLiquidity` onto an unbalanced pool,
+  indexes it, and asserts the replayed reserves equal on-chain `reserves()` exactly. **This
+  is the decisive test**; run it after any change to the indexer or the replay arithmetic.
+- **Which liquidity op moves the price is counter-intuitive — don't "fix" it.** `addLiquidity`
+  adds an EQUAL amount to both reserves, so on an unbalanced pool it pulls the ratio toward
+  50/50 and **does** move the marginal price, with no Buy/Sell emitted. `removeLiquidity`
+  withdraws each reserve in proportion (`shares·reserve/totalSupply`), so the ratio survives
+  and the price does **not** move, aside from ≤1 unit of integer truncation. Both are still
+  indexed regardless: every later Buy/Sell replay step reads the pre-event reserves, and
+  `removeLiquidity` needs the replayed `total_supply`.
 
 ## Critical gotchas (these have bitten us)
 - **USDC is 6 decimals, not 18.** Always use `lib/format.ts` (`parseUsdc`/`formatUsdc`).
