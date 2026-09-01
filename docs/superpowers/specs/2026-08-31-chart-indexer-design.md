@@ -1,8 +1,32 @@
 # Chart Data Indexer — Design
 
-**Date:** 2026-08-31
-**Status:** Approved, pending implementation plan
-**Baseline commit:** `7c03dbc`
+**Date:** 2026-08-31 · revised 2026-09-01
+**Status:** Approved; implementation plan next
+**Baseline commit:** `7c03dbc` (working `eth_getLogs` chart, the rollback point)
+
+### Revision 2026-09-01
+
+Five owner decisions taken after the original draft. Each is reflected in the
+body below; recorded here so the diff is legible.
+
+1. **Background execution is `waitUntil()` from `@vercel/functions`, not
+   `after()` from `next/server`.** `after()` requires Next 15.1+; this project is
+   pinned to **Next 14.2.35**, and upgrading is a semver-major change that
+   `TODO.md:399-409` deliberately keeps as isolated work. The mechanism is
+   quarantined behind `lib/indexer/background.ts` so it can be swapped later
+   without touching the indexer or API design.
+2. **Cron is daily**, flatly — not "hourly on Pro, daily on Hobby". Traffic is
+   the primary trigger; cron is only the floor for when nobody visits.
+3. **A real timestamp-based x-axis is now IN scope** (Polymarket-style). This
+   was previously a non-goal. `PriceChart.tsx` therefore *does* change, and the
+   standing `CLAUDE.md` rule forbidding a time axis is rewritten rather than
+   worked around.
+4. **Two new dependencies, both version-verified:** `pg@8.23.0` (published
+   2026-08-08) and `@vercel/functions@3.9.5` (published 2026-08-20). Against a
+   2026-09-01 clock these are 24 and 12 days old, so both clear the project's
+   7-day release-age floor with margin.
+5. **The git baseline is preserved.** `7c03dbc` and `60151a9` are not rewritten,
+   amended, or force-pushed.
 
 ## Problem
 
@@ -33,9 +57,9 @@ RPC remains the source of truth. Postgres is a read-optimized projection.
 | Managed Postgres | Neon free tier |
 | Indexer runtime | Next.js Route Handler in the existing `frontend/` app |
 | Chart API | Next.js Route Handler, same app |
-| Scheduling | Traffic-triggered `after()` + Vercel Cron as a floor |
+| Scheduling | Traffic-triggered `waitUntil()` + daily Vercel Cron as a floor |
 | Concurrency control | Postgres lease row |
-| New npm dependencies | `pg` only |
+| New npm dependencies | `pg@8.23.0`, `@vercel/functions@3.9.5` |
 
 No VPS, no Docker, no Kubernetes, no Redis, no queue service, no second deploy
 target, no ORM.
@@ -61,8 +85,10 @@ Scheduling is therefore inverted from the obvious design:
 
 - **Traffic-triggered catch-up is primary.** Neon is awake only while the site
   is in use, which is exactly when freshness matters.
-- **Cron is a low-frequency floor** — hourly on Vercel Pro, daily on Hobby
-  (Hobby rejects sub-daily cron expressions at deploy time).
+- **Cron is a daily floor.** Not hourly, not per-minute: daily. Its only job is
+  to advance the checkpoint on a site nobody visited. Vercel Hobby caps cron at
+  once per day and rejects finer expressions at deploy time, so a daily entry
+  is also the one schedule that is valid on every plan without change.
 
 This costs nothing in perceived freshness. The chart appends the **live pool
 price** as its final point (`currentBps`, from `yesProbBps` via `useMarket`).
@@ -274,7 +300,7 @@ the pointer by its cap and stop. The caps differ by trigger:
 
 | Trigger | Blocks per run | Requests per run |
 |---|---|---|
-| User traffic (`after()`) | `INDEXER_TRAFFIC_MAX_BLOCKS` (default 500,000) | 6 |
+| User traffic (`waitUntil()`) | `INDEXER_TRAFFIC_MAX_BLOCKS` (default 500,000) | 6 |
 | Cron / manual | `INDEXER_CRON_MAX_BLOCKS` (default 4,000,000) | 40 |
 
 A run that hits its cap commits its progress and exits; the next run continues.
@@ -292,13 +318,52 @@ traffic-triggered ones.
 GET /api/markets/:id/chart
   → read checkpoint + serve rows from Postgres    (never blocks on indexing)
   → if now() - last_tick_at > INDEXER_STALE_SECONDS:
-        after(() => runIndexer({ maxBlocks: TRAFFIC_MAX_BLOCKS }))
+        scheduleBackgroundIndex({ maxBlocks: TRAFFIC_MAX_BLOCKS })
   → respond immediately
 ```
 
-`after()` from `next/server` shares the function's timeout budget, so the
-traffic caps above are set far below the 300s ceiling. The response is never
-delayed by indexing; the user always gets the latest *available* data.
+Required behaviour, in the owner's words: the chart API responds immediately;
+the user never waits for indexing; indexing runs server-side; the browser is
+never responsible for triggering it; cron remains the periodic safety net;
+concurrent users are serialized by the database lease; and **no user request can
+ever cause an unbounded historical scan.** The last is structural rather than
+defensive — see the per-run caps above.
+
+### The background mechanism is quarantined
+
+All background execution lives behind one module:
+
+```ts
+// frontend/lib/indexer/background.ts
+export function scheduleBackgroundIndex(opts: IndexRunOptions): void
+```
+
+Internally it calls `waitUntil()` from **`@vercel/functions`**, which keeps the
+serverless invocation alive past the response until the promise settles.
+
+`waitUntil()` rather than `after()` from `next/server` for a hard reason:
+`after()` requires **Next 15.1+**, and this project is pinned to **Next
+14.2.35**. Upgrading Next is semver-major, drags wagmi/viem with it, and
+`TODO.md:399-409` explicitly wants that kept as isolated work. `@vercel/functions`
+adds the capability without touching the framework version.
+
+The module is the *only* place that knows how background work is started.
+Everything else calls `scheduleBackgroundIndex`. Swapping to `after()` after a
+future Next upgrade — or to Vercel Queues, or to a plain `void` promise in local
+development — is a one-file change with no effect on the indexer or API design.
+
+Two properties inherited from `waitUntil()` that the design depends on:
+
+- **It shares the function's timeout budget** (Hobby and Pro both cap at 300s
+  under Fluid compute; a timed-out function cancels pending work). The traffic
+  caps above are therefore set far below that ceiling, so a traffic-triggered run
+  finishes or exits cleanly rather than being killed mid-write.
+- **It does not extend the response.** The client gets its JSON immediately;
+  indexing continues after the bytes are flushed.
+
+Locally there is no Vercel runtime, so `background.ts` falls back to awaiting the
+promise directly. That makes the e2e test deterministic instead of racing a
+fire-and-forget.
 
 ### Concurrency control: a lease row, not `pg_advisory_lock`
 
@@ -456,22 +521,75 @@ older than a threshold.
 ## Frontend change
 
 `useTradeHistory` keeps its **exact signature and return shape** —
-`{ points: TradePoint[], isLoading, degraded, complete, refresh }` — so
-`components/PriceChart.tsx` and `app/market/[id]/page.tsx` need **zero edits**.
-Only the hook's internals change: one `fetch` to the chart API instead of a log
-sweep.
+`{ points: TradePoint[], isLoading, degraded, complete, refresh }`. Only its
+internals change: one `fetch` to the chart API instead of a log sweep. So
+`app/market/[id]/page.tsx` needs **zero edits**.
 
 The live `'now'` point is still appended from `currentBps`, unchanged. `degraded`
 now means "the API could not be reached or reports a problem"; `complete` maps
 to `meta.complete`.
 
-The API returns timestamps, but `PriceChart` still draws points **evenly spaced
-by sequence** (`PriceChart.tsx:200-205`). That is unchanged behaviour, not an
-oversight: the x-axis stays sequence-based so the UI is untouched. `t` is carried
-through the hook unused, ready for a later, separately-approved axis change.
-Consequently the hook requests `interval=auto&limit=200`, matching the existing
+The hook requests `interval=auto&limit=200`, matching the existing
 `MAX_POINTS = 200`, so the point count the chart receives is what it already
 expects.
+
+### Time-based x-axis (Polymarket-style)
+
+`TradePoint` gains one **optional** field:
+
+```ts
+interface TradePoint { bps: number; kind: 'buy' | 'sell' | 'now'; t?: number }
+```
+
+`t` is unix **seconds**, from the indexed block timestamp. The `'now'` point
+carries the client clock. `PriceChart.tsx` positions points by time:
+
+```
+x = PAD_LEFT + ((t - tMin) / (tMax - tMin)) * plotW
+```
+
+**`t` is optional for a load-bearing reason, not for convenience.** The RPC
+fallback path has no timestamps — `CachedEvent` stores only `blockNumber` and
+`logIndex` (`logCache.ts:60-68`), and fetching block headers from the browser is
+exactly what this whole change exists to stop. So the chart must render both
+shapes, and the axis mode is chosen from the data:
+
+| Condition | Axis |
+|---|---|
+| Every point has `t`, and `tMax > tMin` | Time-proportional, with date labels |
+| Any point lacks `t`, or all timestamps are equal | Even sequence spacing, as today |
+
+Both modes share one code path: an x-scale function selected once per render.
+Sequence spacing therefore stays as the **degenerate case** of the same
+renderer, not as a second renderer to keep in sync.
+
+Consequences that must be handled rather than discovered:
+
+- **Uneven spacing is the point.** A market with a burst of trades then silence
+  shows a cluster then a flat run. That is the honest shape and the reason for
+  the change; dot radius already shrinks with count (`dotRadius`, `:94-99`), so
+  clusters stay legible.
+- **A long-idle market compresses its history** into the left edge. Accepted:
+  the alternative is lying about when trades happened.
+- **X tick labels use `Intl.DateTimeFormat`**, matching `lib/time.ts` and the
+  standing decision in `DEPENDENCIES.md` to add no date library. Label
+  granularity follows the span: time-of-day within a day, day+month within a
+  year, otherwise month+year.
+- **The `sr-only` table and `aria-label`** (`PriceChart.tsx:227-231`, `:354-372`)
+  gain the timestamp, so the accessible rendering stays equivalent to the visual
+  one rather than falling behind it.
+- The 0–100% y-domain, gridlines, live-price marker, `ResizeObserver` sizing and
+  caption logic are all untouched.
+
+This deliberately overrides the standing rule in `CLAUDE.md` that the x-axis must
+be trade sequence. That rule existed because a time axis implied per-block
+`getBlock` calls from the browser; with timestamps indexed server-side the
+premise is gone. `CLAUDE.md` is rewritten in this change so it no longer forbids
+what the code does — the rule is replaced, not deleted, and the new one keeps the
+part that still matters: **the browser must never call `getBlock` for chart
+points.**
+
+### Source selection and fallback
 
 `NEXT_PUBLIC_CHART_SOURCE` selects `api` (default), `rpc`, or `auto`. In `auto`
 the existing sweep runs only if the API call fails. **The RPC fallback is kept
@@ -519,7 +637,8 @@ Contract addresses and `startBlock` continue to come from
 
 The indexer route rejects any request without a valid `CRON_SECRET`. The
 traffic-triggered path does not go through HTTP at all — it calls the indexer
-module in-process via `after()`, so there is no publicly reachable trigger.
+module in-process via `scheduleBackgroundIndex()`, so there is no publicly
+reachable trigger and the browser never learns that an indexer exists.
 
 Two project standing rules carry into the new surface:
 
@@ -553,11 +672,14 @@ without it.
    - `yes_bps` equals `yesProbBps(reserves())` at the final state
    - the `removeLiquidity` checksum holds
    - the price series includes the `removeLiquidity` move
+   - `block_time` on every event matches the block's on-chain timestamp, and each
+     block header was fetched **once** regardless of how many events it carries
    - running the indexer **twice** changes no row count (idempotency)
    - two concurrent runs produce identical output to one run (lease)
    - a simulated reorg (re-run with a truncated checkpoint) converges
 6. Query the chart API's query function directly and assert bucketing, `outcome=1`
-   flipping to `10000 - yes_bps`, and `limit` enforcement.
+   flipping to `10000 - yes_bps`, `limit` enforcement, and that every returned
+   point carries a `t` that is non-decreasing across the series.
 
 The test database is a Neon branch or any local Postgres reachable via
 `DATABASE_URL`; `pg` speaks to both identically, which is why `pg` was chosen
@@ -567,13 +689,15 @@ over Neon's HTTP driver.
 
 | Phase | Deliverable | Verification gate |
 |---|---|---|
-| 1 | Migrations, `pg` pool, indexer module, local e2e | e2e passes; `tsc --noEmit`; `npm run build` |
+| 1 | Migrations, `pg` pool, indexer module, `background.ts`, local e2e | e2e passes; `tsc --noEmit`; `npm run build` |
 | 2 | Chart API + status endpoint, still unused by the UI | API output compared against the live RPC sweep for the same market |
-| 3 | `useTradeHistory` switched to the API behind `NEXT_PUBLIC_CHART_SOURCE` | chart renders identically; `PriceChart.tsx` unmodified |
-| 4 | Neon provisioned, migrations applied, testnet backfill run, cron enabled | `/api/indexer/status` healthy; reconciliation clean |
+| 3 | `useTradeHistory` switched to the API behind `NEXT_PUBLIC_CHART_SOURCE`; `PriceChart` time axis | chart renders with real dates; sequence fallback still renders when `t` is absent |
+| 4 | Neon provisioned, migrations applied, testnet backfill run, daily cron enabled | `/api/indexer/status` healthy; reconciliation clean |
 
 The chart keeps working throughout: phases 1–2 add code the UI does not call,
-and phase 3 is a single env-var flip with the old path still present.
+and phase 3 is a single env-var flip with the old path still present. The axis
+change ships in phase 3 alongside the data source, because a time axis is
+meaningless until timestamps are actually available.
 
 ## Deployment (to be written out fully at the end of implementation)
 
@@ -588,10 +712,31 @@ re-invoke), force a re-index of a block range, rebuild from empty, and rotate
 
 ## Dependency record
 
-One new runtime dependency: **`pg`**. To be documented in `DEPENDENCIES.md` in
-the existing four-point format (why chosen · why secure · why over alternatives ·
-7-day release-age compliance), with the exact version's publish date verified via
-`npm view pg@<version> time` before pinning.
+Two new runtime dependencies, both verified against the npm registry on
+2026-09-01 and both recorded in `DEPENDENCIES.md` in the existing four-point
+format (why chosen · why secure · why over alternatives · 7-day compliance):
+
+| Package | Version | Published | Age at adoption | 7-day floor |
+|---|---|---|---|---|
+| `pg` | 8.23.0 | 2026-08-08 | 24 days | passes |
+| `@vercel/functions` | 3.9.5 | 2026-08-20 | 12 days | passes |
+
+**`pg` over `@neondatabase/serverless`.** Neon's driver speaks Neon's HTTP
+protocol, which a local Postgres cannot answer. Local testability is a hard
+requirement here, and `pg` addresses a local database, a Neon branch and Neon
+production identically. It is also the oldest, most scrutinised Postgres client
+in the ecosystem, with no native build step — which matters under
+`ignore-scripts=true`.
+
+**`@vercel/functions` over a Next upgrade.** The alternative to it is `after()`
+from `next/server`, which needs Next 15.1+ against the pinned 14.2.35. That
+upgrade is semver-major, pulls wagmi/viem along, and is already earmarked as
+separate work. A first-party Vercel package that adds one function is a smaller
+change than a framework major.
+
+**No ORM, no migration framework, no Redis, no queue.** Migrations are numbered
+`.sql` files with a small runner; the query surface is a handful of parameterized
+statements.
 
 `DEPENDENCIES.md:135-136` currently argues **against** a database and against
 "a subgraph / indexer (The Graph, Ponder)". That entry must be **explicitly
@@ -632,17 +777,43 @@ function's.
   configurable and defaults conservatively.
 - **No frontend test runner exists** (`TODO.md:108-110`), so the API query logic
   is tested from the Hardhat script rather than from a frontend test suite. That
-  keeps dependency count at one but means the assertions live in the contracts
+  keeps dependency count at two but means the assertions live in the contracts
   workspace.
+- **The time axis has no automated test**, for the same reason: `PriceChart` is a
+  React component and there is no renderer to test it with. The x-scale selection
+  is therefore factored into a **pure exported function** taking points and width
+  and returning positions, so it can be asserted from the same Hardhat-run script
+  as everything else. The SVG itself is verified by eye in phase 3.
+- **`waitUntil()` is unverifiable locally.** There is no Vercel runtime on a dev
+  machine, so the production background path cannot be exercised before deploy;
+  locally `background.ts` awaits instead. The first real proof is phase 4, watched
+  through `/api/indexer/status`. This is the main reason the mechanism is isolated
+  in one small module: if it misbehaves in production, the blast radius is one
+  file.
 
 ## Non-goals
 
 - Migrating `/profile` and `/leaderboard` off the log sweep.
-- A time-based x-axis on the chart. Timestamps are now indexed and available, so
-  this becomes possible, but changing the axis would alter the UI, which this
-  change explicitly preserves. Separate decision.
 - Candles, volume bars, or OHLC. The chart is one line.
 - Redis or any cache layer. Postgres with the right index is the first
   optimization; a cache would be added only against a measured need.
 - Indexing `Social.sol` or `MarketMetadata`.
+- Upgrading Next.js. `@vercel/functions` exists in this design precisely so the
+  framework version does not have to move.
+
+## Documentation to update in this change
+
+Not optional extras — each is a file that currently contradicts the new design:
+
+- **`CLAUDE.md`** — replace the trade-sequence x-axis rule (see the frontend
+  section above). The replacement must still forbid browser `getBlock` calls for
+  chart points and must still forbid a reserve *replay in the browser*, while
+  stating that replay is exactly how the indexer derives price server-side.
+  Also: add the indexer/API/Neon layer to the architecture description, and add
+  the new server-only env vars.
+- **`DEPENDENCIES.md`** — the two new entries plus the explicit reversal above.
+- **`frontend/.env.example`** — document every new variable, keeping the file's
+  existing convention of explaining *why* each exists and what happens when it is
+  absent.
+- **`TODO.md`** — session log entry, and close out the "no backend" note.
 

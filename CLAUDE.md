@@ -5,10 +5,23 @@ Guidance for Claude Code working in this repo. Read `TODO.md` for current status
 ## What this is
 Polymarket-style **binary (YES/NO) prediction market** on **Circle's Arc L1** (EVM). Monorepo:
 `contracts/` (Hardhat + Solidity) and `frontend/` (Next.js 14 + wagmi + RainbowKit).
+`frontend/` also holds the **server side** — a blockchain indexer and chart API as Next.js
+Route Handlers backed by managed Neon Postgres. There is no separate backend service, no
+Docker, and no VPS; see the Backend bullet under Architecture.
 
 ## Standing rules (from the project owner — always follow)
 - **Sanitize all outputs.** Chain-derived strings (market question/category, addresses) go through
   `frontend/lib/sanitize.ts` before render. Never `dangerouslySetInnerHTML`.
+  **Storing a string in Postgres does not launder it.** `markets.question` and `.category` come
+  from `MarketCreated` and are attacker-controlled; the database is a cache of on-chain bytes,
+  not a validator. Sanitize on read exactly as before.
+- **Server secrets are NEVER `NEXT_PUBLIC_`.** `DATABASE_URL`, `INDEXER_RPC_URL` and
+  `CRON_SECRET` are server-only and must stay out of any client component or `NEXT_PUBLIC_*`
+  name — anything so prefixed is inlined into the browser bundle. The one public knob is
+  `NEXT_PUBLIC_CHART_SOURCE` (`api` | `rpc` | `auto`), which carries no secret.
+- **Every SQL statement is parameterized** (`$1`, `$2`, …). No string interpolation into SQL,
+  including `interval` and `limit` — validate those against an allowlist and coerce to
+  integers first.
 - **Handle every error.** No unguarded throws in render paths; every `writeContract` has `onError`.
 - **Modular, testable code.** Small units; reuse existing libs/hooks.
 - **Per-dependency justification.** Before adding ANY dependency, document in `DEPENDENCIES.md`:
@@ -46,6 +59,19 @@ Polymarket-style **binary (YES/NO) prediction market** on **Circle's Arc L1** (E
   usePosition), `lib/` (chains, format, sanitize, wagmi, abis, contracts, links,
   metadataFields, logCache, logScan, rpcQueue, marketImages, hiddenMarkets, eventGroups,
   pricing, time, marketMeta, ledger, username).
+- **Backend (new): the indexer and chart API live INSIDE `frontend/`.** There is no separate
+  service and no VPS — deliberately. `app/api/markets/[questionId]/chart/route.ts` serves
+  price history, `app/api/indexer/tick/route.ts` is the cron entry point (Bearer
+  `CRON_SECRET`), `app/api/indexer/status/route.ts` is the health endpoint. The indexer
+  itself is `lib/indexer/**` (pure modules, never imported by a client component),
+  `lib/db/**` owns the `pg` pool and queries, and `db/migrations/*.sql` plus `db/migrate.ts`
+  own the schema. Data lands in **Neon Postgres** (managed, free tier), keyed by
+  `(chain_id, block_number, log_index)`.
+  **RPC remains the source of truth; Postgres is only a read-optimized projection of it.**
+  Four tables: `indexer_state` (checkpoint + lease), `blocks` (timestamp cache + reorg
+  witness, only blocks containing events), `markets`, `market_events` (raw args *and*
+  replayed reserves *and* derived prices, append-only).
+  Design spec: `docs/superpowers/specs/2026-08-31-chart-indexer-design.md`.
 - **There is no `/portfolio` page.** Its UI is `components/PortfolioPanel.tsx`, rendered inside
   `ProfileView` beneath the username — so it works for ANY wallet, not just the connected one,
   and there is one implementation rather than two. The route still exists as a server-side
@@ -107,6 +133,13 @@ Polymarket-style **binary (YES/NO) prediction market** on **Circle's Arc L1** (E
 - `npm run dev` — frontend dev server
 - Full lifecycle proof (no wallet): `cd contracts && npx hardhat run scripts/e2e-local.ts`
 - Frontend check: `cd frontend && npx tsc --noEmit && npm run build`
+- `npm run db:migrate` — apply `frontend/db/migrations/*.sql` to `DATABASE_URL` (idempotent;
+  records applied filenames in `schema_migrations`)
+- Indexer proof end-to-end, no testnet needed:
+  `cd contracts && npx hardhat run scripts/e2e-indexer.ts` — deploys locally, emits every
+  indexed event including a price-moving `removeLiquidity`, indexes it, and asserts the
+  replayed reserves equal on-chain `reserves()` exactly. **This is the decisive test**; run
+  it after any change to the indexer or the replay arithmetic.
 
 ## Critical gotchas (these have bitten us)
 - **USDC is 6 decimals, not 18.** Always use `lib/format.ts` (`parseUsdc`/`formatUsdc`).
@@ -128,16 +161,51 @@ Polymarket-style **binary (YES/NO) prediction market** on **Circle's Arc L1** (E
 - **Validate question length in BYTES, not characters.** The contracts check
   `bytes(question).length <= 256`; a multi-byte string can pass a char check and still revert.
   Same for every `MarketMetadata` field — use `byteLength` from `lib/metadataFields.ts`.
-- **The chart never reconstructs pool state.** `useTradeHistory` reads the price straight
-  out of each `Buy`/`Sell` event's own args (`investmentAmount / sharesOut`, flipped for NO),
-  so there is no reserve replay, no creation-block scan and no per-block `getBlock`. The
-  earlier replay version was correct but so RPC-hungry it caused the 429s it then reported.
-  Do not reintroduce a replay, a verification gate, or a time axis — the x-axis is trade
-  SEQUENCE precisely so timestamps are never fetched. The last point is always the live
-  contract price, so the chart still renders when zero logs load; failures set `degraded`,
-  which labels the line instead of hiding it.
+- **Chart history comes from the INDEXER, not the browser.** Price history is served by
+  `GET /api/markets/[questionId]/chart` out of Neon Postgres; `useTradeHistory` fetches it
+  and does no log scanning on the primary path. Three rules, all load-bearing:
+  1. **The browser must NEVER call `getBlock` for chart points.** Timestamps are indexed
+     server-side, once per event-bearing block, and cached in the `blocks` table forever.
+     Per-block header fetches from the browser are what made a time axis impossible before;
+     that cost now belongs to the indexer, where it is paid once for all visitors.
+  2. **The x-axis is REAL TIME** (Polymarket-style), driven by those indexed timestamps.
+     `TradePoint.t` is unix seconds and is **optional** — the RPC fallback path has no
+     timestamps, so `PriceChart` selects an x-scale per render: time-proportional when every
+     point has `t` and the span is non-zero, even sequence spacing otherwise. Sequence
+     spacing is the degenerate case of the same renderer, not a second one. Don't delete it:
+     it is what the fallback draws.
+  3. **Reserve replay is the indexer's job and MUST NOT return to the browser.** The
+     indexer reconstructs pool reserves exactly from the four FPMM events
+     (`Buy`/`Sell`/`LiquidityAdded`/`LiquidityRemoved`) with no RPC reads at all — see the
+     spec for the per-event arithmetic — and stores the marginal price per event. An earlier
+     *browser-side* replay was correct but so RPC-hungry it caused the 429s it then
+     reported. Server-side it is nearly free; client-side it is still forbidden.
+  The chart plots **marginal implied probability** (`reserveNo / (reserveYes + reserveNo)`,
+  i.e. `yesProbBps`) for every point. It used to plot fee-inclusive *execution* prices
+  historically and the marginal price for the live point — two different quantities, giving a
+  fake jump of up to ±fee at the right edge. Don't reintroduce that mix; `exec_yes_bps` is
+  stored but deliberately not plotted.
+  The last point is still the live contract price, so the chart renders even when the API
+  and every log load fail; failures set `degraded`, which labels the line instead of hiding
+  it.
+- **Indexer lag never blocks the current price.** The live final point comes from
+  `yesProbBps(reserveYes, reserveNo)` via RPC, so a stale index degrades *history* only.
+  This is why daily cron is sufficient and why per-minute cron is actively wrong — it would
+  keep Neon's compute awake continuously and blow the free tier's 100 CU-hours/month, which
+  suspends the database for the rest of the billing month.
+- **A user request must never trigger an unbounded scan.** Indexing is forward-only from one
+  checkpoint, capped per run (`INDEXER_TRAFFIC_MAX_BLOCKS` on the traffic path,
+  `INDEXER_CRON_MAX_BLOCKS` on cron), guarded by a Postgres lease row so simultaneous
+  visitors can't double-index, and idempotent via `ON CONFLICT DO NOTHING` on
+  `(chain_id, block_number, log_index)`. Background work is started ONLY through
+  `lib/indexer/background.ts` (`waitUntil()` from `@vercel/functions` — not `after()`, which
+  needs Next 15.1+ and we are pinned to 14.2.35). Keep that module the single place that
+  knows how background execution works.
 - **Log history is ANCHORED at the factory's deploy block, and is a GROWING window.**
-  `lib/logScan.ts` owns the sweep for both `useTradeHistory` and `useTradeLedger`.
+  `lib/logScan.ts` owns the sweep for `useTradeLedger` and for `useTradeHistory`'s
+  **fallback** path only — the chart's primary path is the indexer API. The sweep still
+  matters: `/profile` and `/leaderboard` depend on it entirely, and it is what draws the
+  chart when Neon is suspended or unreachable. Everything below still applies to it.
   Two rules, both load-bearing:
   1. **The floor is `deployments[chainId].startBlock`** (via `getStartBlock`), the block
      `MarketFactory` was deployed in. No Buy/Sell can predate it, so it is an exact bound.
