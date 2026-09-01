@@ -1,5 +1,19 @@
 /**
- * Exact reserve reconstruction for a FixedProductMarketMaker, from its events alone.
+ * Reserve reconstruction for a FixedProductMarketMaker, from its emitted events.
+ *
+ * SCOPE OF "EXACT". The replay is exact **with respect to the emitted event
+ * stream**: given every LiquidityAdded/LiquidityRemoved/Buy/Sell the pool has
+ * emitted, in order, from a correct starting state, the reserves computed here
+ * equal the reserves the contract would report. That is NOT the same as
+ * "exact reserves" unconditionally. The pool is an `ERC1155Holder`, so ANY
+ * address can transfer YES/NO tokens straight to it; `reserves()` reads
+ * `conditionalTokens.balanceOf` (:77-80), so such a transfer moves the real
+ * reserves while emitting no FPMM event at all. Buy/Sell carry no recomputable
+ * invariant, so they always report `checksumOk: true` and that class of drift is
+ * invisible here — nothing in this module can detect it. Catching it requires
+ * reconciling the replayed state against a live `reserves()` call, which is
+ * Task 9's decisive assertion and a production follow-up. Do not add
+ * reconciliation to this module: it must stay pure and RPC-free.
  *
  * ZERO IMPORTS, deliberately. This module is imported both by the Next.js app
  * (ESM, `@/` aliases, bundler resolution) and by the Hardhat/mocha test suite in
@@ -7,9 +21,10 @@
  * viem, a node builtin, an `@/`-aliased sibling — breaks one of those two
  * consumers. Keep it self-contained.
  *
- * Why event-only replay works: every state transition of the pool is fully
- * determined by the arguments of the event it emits, so no `eth_call`, no `fee`
- * value and no archive node are needed. See contracts/src/FixedProductMarketMaker.sol:
+ * Why event-only replay works: every state transition performed by the
+ * contract's own entry points is fully determined by the arguments of the event
+ * it emits, so no `eth_call`, no `fee` value and no archive node are needed.
+ * See contracts/src/FixedProductMarketMaker.sol:
  *
  *  - LiquidityAdded (:103)  splits the WHOLE collateral amount into full sets, so
  *    it adds an EQUAL amount to BOTH reserves. On an unbalanced pool that pulls
@@ -92,9 +107,23 @@ export function yesProbBps(reserveYes: bigint, reserveNo: bigint): number {
 /**
  * Average price actually paid/received on this trade, expressed on the YES side
  * in bps. collateral/shares is already a price because a share redeems for
- * exactly 1 collateral unit, so the ratio must land in 1..10000; anything
- * outside that is a decode error or a degenerate log, and null is the honest
- * answer rather than a clamped lie. A NO-side price p is 10000-p on YES.
+ * exactly 1 collateral unit. A NO-side price p is 10000-p on YES.
+ *
+ * CONSUMERS: 0 is a LEGITIMATE return value, and it is falsy. An `outcome === 1`
+ * trade executed at exactly 10000 bps on the NO side is 0 on the YES side, and a
+ * sub-1bp YES trade at extreme odds floors to 0 as well. Test with `=== null` or
+ * coalesce with `??`. `if (execYesBps(...))` and `execYesBps(...) || fallback`
+ * both silently discard a real 0 and will draw a hole in the chart.
+ *
+ * The two bounds are deliberately asymmetric. Above 10000 is REJECTED because it
+ * is provably impossible on-chain — a share pays out at most 1 collateral unit,
+ * so paying more than that per share means the log was mis-decoded (wrong arg
+ * order, wrong event, wrong decimals) and null is the honest answer rather than a
+ * clamped lie. Below 1 bp is ACCEPTED, because that is just a cheap outcome in a
+ * lopsided pool: at 6 decimals, 1 unit of collateral for 20000 shares is a real
+ * trade the contract will happily execute, and rejecting it would drop the very
+ * trades that carry the most information about a near-resolved market. Only the
+ * degenerate cases are excluded, by the zero guards above.
  */
 export function execYesBps(
   kind: EventKind,
@@ -106,19 +135,26 @@ export function execYesBps(
   if (outcome !== 0 && outcome !== 1) return null;
   if (shares <= BigInt(0) || collateral <= BigInt(0)) return null;
   const bps = Number((collateral * BPS) / shares);
-  if (bps < 1 || bps > 10000) return null;
+  if (bps > 10000) return null;
   return outcome === 0 ? bps : 10000 - bps;
 }
 
 /**
  * Fold one event into the pool state. Returns a NEW state; never mutates.
  *
- * checksumOk is the one place the event stream can be caught lying: for
- * LiquidityRemoved the contract emits `collateral = min(yesOut, noOut)` (:140),
- * which we can recompute from the pre-event reserves, so a mismatch means our
- * reserves have drifted (a missed event, a reorg, a wrong start state). It is
- * also false for the two malformed inputs we refuse to guess at: removing
- * liquidity from a zero LP supply, and a trade with no outcome side.
+ * checksumOk is where the event stream can be caught disagreeing with the
+ * replayed reserves. Both liquidity events carry a value that is fully
+ * recomputable from PRE-event state, so each one is a free drift detector:
+ *  - LiquidityAdded emits `shares`, which is `amount` for the first LP and
+ *    `amount·totalSupply/min(yesBefore,noBefore)` after that (:105-111).
+ *  - LiquidityRemoved emits `collateral = min(yesOut, noOut)` (:140).
+ * A mismatch in either means our reserves have drifted — a missed event, a
+ * reorg, a wrong start state. Buy and Sell have no such recomputable invariant
+ * (that would need `fee` and the pre-trade reserves we are trying to verify), so
+ * they report true unless the arithmetic underflows; see the scope note at the
+ * top of this file for what that does not cover. checksumOk is also false for the
+ * two malformed inputs we refuse to guess at: removing liquidity from a zero LP
+ * supply, and a trade with no outcome side.
  */
 export function applyEvent(
   state: PoolState,
@@ -127,13 +163,25 @@ export function applyEvent(
   const { reserveYes, reserveNo, totalSupply } = state;
 
   if (ev.kind === 'liquidity_added') {
+    // Recompute the LP shares the contract must have minted (:105-111). First LP
+    // is 1:1 with the collateral; afterwards it is proportional to the SMALLER
+    // pre-event reserve, floor-divided. minReserve cannot be 0 while
+    // totalSupply > 0 on-chain (the contract would divide by zero and revert),
+    // so if we see it, our reserves are wrong — report rather than throw.
+    const minReserve = reserveYes < reserveNo ? reserveYes : reserveNo;
+    const expectedShares =
+      totalSupply <= BigInt(0)
+        ? ev.collateral
+        : minReserve > BigInt(0)
+          ? (ev.collateral * totalSupply) / minReserve
+          : null;
     return {
       state: {
         reserveYes: reserveYes + ev.collateral,
         reserveNo: reserveNo + ev.collateral,
         totalSupply: totalSupply + ev.shares,
       },
-      checksumOk: true,
+      checksumOk: expectedShares !== null && expectedShares === ev.shares,
     };
   }
 
