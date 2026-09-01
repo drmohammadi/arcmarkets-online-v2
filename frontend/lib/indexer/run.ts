@@ -107,7 +107,7 @@ export interface IndexRunOptions {
   maxRequests: number;
   reason: 'traffic' | 'cron' | 'manual';
   /**
-   * Index this chain instead of the configured one, bypassing both
+   * Index this chain instead of the configured one, replacing
    * `getIndexerConfig()`'s chain fields and the deployments lookup.
    *
    * This exists because the local Hardhat chain (31337) has no entry in
@@ -115,6 +115,11 @@ export interface IndexRunOptions {
    * REAL deployments, and a fake entry there would show a phantom chain to the
    * whole frontend. The e2e proof passes its freshly-deployed factory address,
    * `startBlock: 0` and `confirmations: 0` through here instead.
+   *
+   * NOT config-free: `DATABASE_URL` and `INDEXER_CHUNK_BLOCKS` are still read.
+   * The chunk width is a property of the RPC ENDPOINT rather than of the chain,
+   * and the per-chain `accepted_chunk` already supersedes it, so there would be
+   * nothing for an override to say about it.
    */
   chain?: ChainSettings;
 }
@@ -149,18 +154,40 @@ export interface IndexRunResult {
    * `degraded`.
    */
   checksumFailures: number;
+  /**
+   * There WAS a range to cover and the checkpoint did not move.
+   *
+   * Distinct from `budgetStopped`, which means a cap ended a run that still
+   * committed something. This is the pathological case: a run that reached the
+   * head of nothing, repeated, is zero progress. It is reported through
+   * `last_error` as well, so `/api/indexer/status` shows `degraded` rather than a
+   * healthy tick — a stamped `last_tick_at` with no error would make a stuck
+   * indexer indistinguishable from an idle one.
+   *
+   * False when there was genuinely nothing to do (`safeHead <= last_indexed_block`),
+   * which is a healthy state and stays one.
+   */
+  noProgress: boolean;
 }
 
 /**
- * How many STORED blocks the reorg walk-back may examine before giving up.
+ * How deep a reorg this indexer will handle, in blocks, and how many stored
+ * blocks the probe will examine. One constant because they are one question.
  *
- * Each candidate costs one `eth_getBlock`, so an unbounded walk on a chain whose
- * stored history disagrees everywhere would spend thousands of requests and then
- * fail anyway. Only event-bearing blocks are stored, so 256 candidates usually
- * span far more than 256 blocks — this is a bound on WORK, not on depth. Beyond
- * it the run reports an error (hence `degraded`) and truncates NOTHING, because a
- * disagreement that deep is not a routine reorg and deleting history on a guess
- * is worse than stopping and being noticed.
+ * TWO ROLES, both bounds on the same thing:
+ *  - the probe examines at most this many stored `blocks` rows, each costing one
+ *    `eth_getBlock`, so a chain that disagrees everywhere cannot spend thousands
+ *    of requests;
+ *  - a fork more than this many blocks below the checkpoint is NOT treated as a
+ *    reorg. It is reported and nothing is truncated.
+ *
+ * The second role is an assumption, and it is the same KIND of assumption as
+ * `INDEXER_CONFIRMATIONS` (12 blocks of finality) — 21x more conservative. It is
+ * also CHECKED rather than merely assumed: a stored block that disagrees with the
+ * chain more than this far down contradicts it, and that case reports instead of
+ * cutting. See `probeReorgCut` for why the bound has to exist at all — `blocks`
+ * holds only event-bearing blocks, so "no stored witness nearby" is common and is
+ * NOT evidence that no common ancestor exists.
  */
 export const MAX_REORG_WALKBACK = 256;
 
@@ -528,7 +555,44 @@ function emptyResult(from: bigint): IndexRunResult {
     error: null,
     budgetStopped: false,
     checksumFailures: 0,
+    noProgress: false,
   };
+}
+
+/**
+ * Write this run's accumulated notes to `last_error`, or clear it when there are
+ * none.
+ *
+ * `recordError(chainId, null)` is the "ticked, nothing wrong" path: it stamps
+ * `last_tick_at` so `/api/indexer/status` does not call a healthy idle chain
+ * `stalled`, and clears a stale error because this run proved the indexer alive.
+ * Anything in `notes` makes the same stamp report `degraded` instead — which is
+ * the point: a tick is not the same claim as a healthy tick.
+ */
+async function flushNotes(chainId: number, notes: readonly string[]): Promise<void> {
+  await recordError(chainId, notes.length > 0 ? notes.join(' | ') : null);
+}
+
+/**
+ * A run that had a range to cover and committed none of it.
+ *
+ * Not an `error` — no request failed — and not merely `budgetStopped`, which
+ * describes a run that committed something and stopped early. Zero progress on a
+ * chain with blocks to index is a distinct fact, and left unmarked it stamps a
+ * HEALTHY tick: repeated, that is a stuck indexer reporting as a working one.
+ * So it is both a result flag and a `last_error` note.
+ */
+async function noProgressResult(
+  chainId: number,
+  notes: string[],
+  what: string,
+  result: IndexRunResult
+): Promise<IndexRunResult> {
+  const note = `${what} covered no contiguous range; the checkpoint did not move`;
+  console.error(`[indexer] chain ${chainId}: ${note}`);
+  notes.push(note);
+  await flushNotes(chainId, notes);
+  return { ...result, noProgress: true };
 }
 
 /**
@@ -633,23 +697,43 @@ export async function runIndexer(opts: IndexRunOptions): Promise<IndexRunResult>
   }
   const state = leased;
 
-  // The remembered ceiling seeds the sweep width; `rpc.ts` shrinks it within this
-  // object when the endpoint refuses a width and never grows it back.
-  const rpc = createIndexerRpc(settings.rpcUrl, state.acceptedChunk ?? configuredChunk, {
-    // retryCount: 0 so `maxRequests` is a literal count of round trips rather
-    // than a quarter of one — viem's http transport retries 3 times by default,
-    // underneath `rpc.ts`'s own rate-limit ladder. The ladder still handles 429s;
-    // what this removes is a silent 4x multiplier on every other failure.
-    transport: http(settings.rpcUrl, { retryCount: 0 }),
-  });
-
   let requests = 0;
   let reorgDepth = 0;
   let cursor = state.lastIndexedBlock;
   let cursorHash = state.lastIndexedBlockHash;
   let backfillComplete = state.backfillComplete;
+  /** True once a range exists to cover, so "committed nothing" becomes reportable. */
+  let hadWork = false;
+  /**
+   * Facts worth `degraded` that are not failures: a reorg, replay drift, a run
+   * that covered nothing. Written to `last_error` on EVERY exit path that reaches
+   * the database, and always AFTER the range commit — `commitCheckpoint` clears
+   * `last_error`, so a note written before it would be erased by the very
+   * transaction it describes.
+   */
+  const notes: string[] = [];
 
   try {
+    // Built INSIDE the try: `http()` and `createPublicClient` can throw, and
+    // outside it that would be an unhandled rejection AND an orphaned lease —
+    // breaking both non-negotiables at once. Nothing between `acquireLease` and
+    // this `try` may fail.
+    //
+    // The remembered ceiling seeds the sweep width; `rpc.ts` shrinks it within this
+    // object when the endpoint refuses a width and never grows it back. It comes
+    // from `accepted_chunk` (per chain) or `INDEXER_CHUNK_BLOCKS`, NOT from
+    // `IndexRunOptions.chain`: a range limit is a property of the ENDPOINT, and the
+    // per-chain learned value already supersedes the configured one. The override
+    // replaces the chain's identity, anchor, endpoint and finality window; the
+    // sweep width and `DATABASE_URL` still come from config.
+    const rpc = createIndexerRpc(settings.rpcUrl, state.acceptedChunk ?? configuredChunk, {
+      // retryCount: 0 so `maxRequests` is a literal count of round trips rather
+      // than a quarter of one — viem's http transport retries 3 times by default,
+      // underneath `rpc.ts`'s own rate-limit ladder. The ladder still handles 429s;
+      // what this removes is a silent 4x multiplier on every other failure.
+      transport: http(settings.rpcUrl, { retryCount: 0 }),
+    });
+
     const head = await rpc.getBlockNumber();
     requests += 1;
     const safeHead = computeSafeHead(head, settings.confirmations);
@@ -661,23 +745,21 @@ export async function runIndexer(opts: IndexRunOptions): Promise<IndexRunResult>
       const atCursor = await rpc.getBlockHeader(cursor);
       requests += 1;
       if (atCursor.hash !== cursorHash.toLowerCase()) {
-        const walk = await walkBackToCommonAncestor(rpc, chainId, cursor);
-        requests += walk.requests;
-        if (walk.cut === null && walk.boundReached) {
-          // Bounded rather than endless, and it truncates NOTHING: a chain that
-          // disagrees with 256 stored blocks is not having a routine reorg, and
-          // deleting to the anchor on that guess would discard a whole history
-          // because a walk was cut short.
+        const candidates = await blocksAtOrBelow(chainId, cursor - ONE, MAX_REORG_WALKBACK);
+        const probe = await probeReorgCut(rpc, candidates, cursor, settings.startBlock);
+        requests += probe.requests;
+        if (probe.cut === null) {
+          // The disagreement is deeper than this indexer handles. Truncate NOTHING
+          // and report: a valid ancestor may sit just past the bound, and deleting
+          // a whole history because a probe was cut short is not a trade to make.
           throw new Error(
-            `reorg walk-back on chain ${chainId} examined ${walk.examined} stored blocks below ` +
-              `${cursor} without finding one the chain still agrees with; the bound is ` +
-              `${MAX_REORG_WALKBACK}. Nothing was truncated.`
+            `reorg probe on chain ${chainId} examined ${probe.examined} stored blocks below ` +
+              `${cursor} and found the chain disagreeing deeper than ${MAX_REORG_WALKBACK} ` +
+              'blocks. Nothing was truncated; re-index this chain deliberately.'
           );
         }
-        // No stored block survives at all, so the only sound floor left is the
-        // factory's deploy block — no market event can predate it.
-        const cut = walk.cut === null ? settings.startBlock - ONE : walk.cut;
-        const cutHash = walk.cut === null ? null : walk.cutHash;
+        const cut = probe.cut;
+        const cutHash = probe.cutHash;
         reorgDepth = toCount(cursor - cut);
         // One transaction: rows above the cut and the checkpoint that describes
         // them must never disagree, not even for the width of a crash.
@@ -685,11 +767,12 @@ export async function runIndexer(opts: IndexRunOptions): Promise<IndexRunResult>
           await truncateAbove(c, chainId, cut);
           await resetCheckpoint(c, chainId, cut, cutHash);
         });
-        console.error(
-          `[indexer] reorg on chain ${chainId}: block ${cursor} no longer matches its stored ` +
-            `hash. Truncated above ${cut} (${reorgDepth} blocks) and rewound the checkpoint; ` +
-            're-indexing forward from there in this same run.'
-        );
+        const note =
+          `reorg on chain ${chainId}: block ${cursor} no longer matches its stored hash; ` +
+          `cut at ${cut} (${reorgDepth} blocks, ${probe.reason}) and re-indexing forward`;
+        // A rewind to the anchor re-does the entire backfill. Never quietly.
+        notes.push(note);
+        console.error(`[indexer] ${note}`);
         cursor = cut;
         cursorHash = cutHash;
         backfillComplete = false;
@@ -699,12 +782,13 @@ export async function runIndexer(opts: IndexRunOptions): Promise<IndexRunResult>
     // -- Range. One cursor, forward only.
     const range = clampRange(cursor, safeHead, opts.maxBlocks);
     if (range === null) {
-      // Caught up. Still a tick: without the stamp `/api/indexer/status` calls a
-      // healthy, idle chain `stalled`. The null also clears a stale error, which
-      // is right — this run proved the indexer is alive.
-      await recordError(chainId, null);
+      // Caught up — genuinely nothing to do, which is a healthy state and stays
+      // one. Still a tick: without the stamp `/api/indexer/status` calls a healthy,
+      // idle chain `stalled`.
+      await flushNotes(chainId, notes);
       return { ...emptyResult(cursor + ONE), requests, reorgDepth, backfillComplete };
     }
+    hadWork = true;
 
     // -- Two sweeps, one budget. The factory goes first because its
     // -- `MarketCreated` logs are what name the pool addresses to ask about; the
@@ -731,14 +815,13 @@ export async function runIndexer(opts: IndexRunOptions): Promise<IndexRunResult>
       // whatever it learned about the endpoint's width limit — `acceptedSpan` can
       // be non-null here — or those requests bought nothing at all.
       await persistLearnedChunk(chainId, state.acceptedChunk, [factorySweep.acceptedSpan]);
-      await recordError(chainId, null);
-      return {
+      return await noProgressResult(chainId, notes, `factory sweep of [${range.from}, ${range.to}]`, {
         ...emptyResult(range.from),
         requests,
         reorgDepth,
         backfillComplete,
         budgetStopped: true,
-      };
+      });
     }
 
     const poolToQuestion = await questionIdByFpmm(chainId);
@@ -778,14 +861,13 @@ export async function runIndexer(opts: IndexRunOptions): Promise<IndexRunResult>
         factorySweep.acceptedSpan,
         poolSweep ? poolSweep.acceptedSpan : null,
       ]);
-      await recordError(chainId, null);
-      return {
+      return await noProgressResult(chainId, notes, `pool sweep of [${range.from}, ${factorySweep.coveredTo}]`, {
         ...emptyResult(range.from),
         requests,
         reorgDepth,
         backfillComplete,
         budgetStopped: true,
-      };
+      });
     }
 
     const created = atOrBelow(factory.created, coverageTo);
@@ -936,7 +1018,8 @@ export async function runIndexer(opts: IndexRunOptions): Promise<IndexRunResult>
 
     // AFTER the commit, deliberately: `commitCheckpoint` clears `last_error`, so a
     // note written before it would be erased by the very transaction that stored
-    // the rows it is about.
+    // the rows it is about. (This is also why a reorg note pushed earlier in this
+    // run is only flushed here.)
     //
     // HOW LONG THE SIGNAL LASTS. `last_error` is cleared by the next successful
     // tick, so `degraded` is reported until then and no longer — there is no
@@ -945,7 +1028,6 @@ export async function runIndexer(opts: IndexRunOptions): Promise<IndexRunResult>
     // reconciling replayed reserves against a live `reserves()` call is the
     // durable check the design assigns to the cron path. Do not read a cleared
     // `last_error` as evidence the drift was resolved.
-    const notes: string[] = [];
     if (checksumFailures > 0) {
       notes.push(`replay checksum mismatch on ${checksumFailures} event(s): ${drift.join(', ')}`);
     }
@@ -960,7 +1042,7 @@ export async function runIndexer(opts: IndexRunOptions): Promise<IndexRunResult>
       );
       notes.push(`${grouped.orphans.length} pool event(s) could not be attributed to a market`);
     }
-    if (notes.length > 0) await recordError(chainId, notes.join(' | '));
+    await flushNotes(chainId, notes);
 
     return {
       ranBlocks: effectiveTo - range.from + ONE,
@@ -974,6 +1056,7 @@ export async function runIndexer(opts: IndexRunOptions): Promise<IndexRunResult>
       error: null,
       budgetStopped,
       checksumFailures,
+      noProgress: false,
     };
   } catch (err) {
     // Every failure lands here, including a hard `getLogsAdaptive` rejection.
@@ -987,6 +1070,9 @@ export async function runIndexer(opts: IndexRunOptions): Promise<IndexRunResult>
       requests,
       reorgDepth,
       backfillComplete,
+      // A failed run that had a range to cover advanced the checkpoint by zero
+      // blocks, which is exactly what `noProgress` reports. `error` says why.
+      noProgress: hadWork,
       error: await reportError(chainId, err),
     };
   } finally {
@@ -994,52 +1080,113 @@ export async function runIndexer(opts: IndexRunOptions): Promise<IndexRunResult>
   }
 }
 
-/**
- * Find the deepest stored block the chain still agrees with, below `cursor`.
- *
- * Walks the stored blocks HIGHEST FIRST, so the first match is the SHALLOWEST
- * correct cut — truncating deeper would delete rows the chain still confirms.
- *
- * Three outcomes, and the difference between the last two decides whether history
- * gets deleted:
- *  - a stored block matches: `cut` is it, `cutHash` its freshly read hash;
- *  - nothing matched and there were fewer than `MAX_REORG_WALKBACK` candidates:
- *    every stored block is gone. `cut` is null with `boundReached: false`, and the
- *    caller rewinds to the anchor, which is always a sound floor.
- *  - nothing matched and the bound was reached: `cut` is null with
- *    `boundReached: true`. The caller must REPORT, not truncate — there may be a
- *    valid ancestor just past the bound, and deleting to the anchor on that guess
- *    would throw away a whole history over a walk that was merely cut short.
- */
-async function walkBackToCommonAncestor(
-  rpc: { getBlockHeader(n: bigint): Promise<{ hash: string; timestamp: bigint }> },
-  chainId: number,
-  cursor: bigint
-): Promise<{
+/** The minimum a reorg probe needs from the RPC facade, so it can be stubbed. */
+export interface BlockHeaderReader {
+  getBlockHeader(n: bigint): Promise<{ hash: string; timestamp: bigint }>;
+}
+
+/** Where a reorg probe decided to cut, and on what grounds. */
+export interface ReorgProbe {
+  /** The cut, or null meaning DO NOT TRUNCATE — report instead. */
   cut: bigint | null;
+  /** First-hand hash of `cut`, or null when it is the anchor (not a block we index). */
   cutHash: string | null;
-  boundReached: boolean;
+  reason: 'verified-ancestor' | 'bounded-window' | 'no-indexed-data' | 'full-rewind' | 'too-deep';
   examined: number;
   requests: number;
-}> {
-  // `cursor` itself already failed the comparison, so start below it.
-  const candidates = await blocksAtOrBelow(chainId, cursor - ONE, MAX_REORG_WALKBACK);
+}
+
+/**
+ * Decide where to cut after the checkpoint's hash stopped matching the chain.
+ *
+ * THE TRAP THIS EXISTS TO AVOID. `blocks` holds ONLY event-bearing blocks, so an
+ * empty or far-below candidate list is the NORMAL state, not evidence that no
+ * common ancestor exists. Reading it that way turns an ordinary one-block tip
+ * reorg into a rewind to the anchor: on Arc testnet, with trades clustered near
+ * 55.7M and the checkpoint past 57.3M, cutting at "the highest stored block that
+ * still matches" throws away 1.6M blocks of sweep progress, and cutting at the
+ * anchor when nothing is stored yet throws away all 1.7M. Neither loses data —
+ * every write is idempotent — but both silently redo the whole backfill, and
+ * silent-and-total is the failure class this project has already shipped twice.
+ *
+ * WHAT MAKES A CUT SOUND. Two things must hold for every block at or below it:
+ * any stored hash still matches the chain, and the implicit claim "this block was
+ * scanned" is still true. A verified stored hash proves BOTH for everything below
+ * it (a fork underneath would have changed that hash). Where there is no stored
+ * hash there is no proof, so the cut rests on `MAX_REORG_WALKBACK` as a maximum
+ * fork depth — stated, 21x `confirmations`, and contradicted loudly rather than
+ * assumed away: a stored block that disagrees from deeper than the bound returns
+ * `too-deep` and truncates nothing.
+ *
+ * `candidates` must be the stored blocks at or below `cursor - 1`, HIGHEST FIRST,
+ * at most `MAX_REORG_WALKBACK` of them — `blocksAtOrBelow` returns exactly that.
+ * It is a parameter rather than a query so the decision is testable offline.
+ */
+export async function probeReorgCut(
+  rpc: BlockHeaderReader,
+  candidates: readonly BlockRow[],
+  cursor: bigint,
+  anchor: bigint
+): Promise<ReorgProbe> {
+  const depthFloor = cursor - BigInt(MAX_REORG_WALKBACK);
+  const atAnchor = anchor - ONE;
   let requests = 0;
   let examined = 0;
+  let verified: bigint | null = null;
+  let verifiedHash: string | null = null;
+  let lowestMismatch: bigint | null = null;
 
   for (const candidate of candidates) {
     examined += 1;
     const header = await rpc.getBlockHeader(candidate.blockNumber);
     requests += 1;
     if (header.hash === candidate.blockHash.toLowerCase()) {
-      return { cut: candidate.blockNumber, cutHash: header.hash, boundReached: false, examined, requests };
+      verified = candidate.blockNumber;
+      verifiedHash = header.hash;
+      break;
     }
+    // Descending, so this keeps getting lower and ends at the deepest disagreement.
+    lowestMismatch = candidate.blockNumber;
   }
 
+  // A disagreement deeper than the bound contradicts it. Report; truncate nothing.
+  if (lowestMismatch !== null && lowestMismatch <= depthFloor) {
+    return { cut: null, cutHash: null, reason: 'too-deep', examined, requests };
+  }
+  // The probe ran out of budget before finding an ancestor: same answer, and for
+  // the same reason — there may be a valid ancestor just past the bound, and
+  // deleting a whole history because a walk was cut short is not a trade to make.
+  if (verified === null && candidates.length >= MAX_REORG_WALKBACK) {
+    return { cut: null, cutHash: null, reason: 'too-deep', examined, requests };
+  }
+
+  // Highest sound cut: a verified ancestor if it is above the bound, else the
+  // bound itself. Mismatches (all above `depthFloor` by the guard) cap it, and it
+  // can never fall below the anchor.
+  //
+  // Note that finding NO match is not a reason to rewind further. Every mismatch
+  // sits above `depthFloor`, and with fewer than `MAX_REORG_WALKBACK` candidates
+  // that list is COMPLETE — so nothing we hold at or below `depthFloor` is in
+  // question, and cutting there deletes exactly the invalid rows. The anchor is
+  // reached only when the checkpoint is itself within the bound of it, i.e. when
+  // the whole indexed span is inside the reorg window.
+  const base = verified !== null && verified > depthFloor ? verified : depthFloor;
+  const capped = lowestMismatch === null ? base : base < lowestMismatch - ONE ? base : lowestMismatch - ONE;
+  const cut = capped < atAnchor ? atAnchor : capped;
+
+  if (cut === atAnchor) {
+    return { cut, cutHash: null, reason: 'full-rewind', examined, requests };
+  }
+  if (verified !== null && cut === verified) {
+    return { cut, cutHash: verifiedHash, reason: 'verified-ancestor', examined, requests };
+  }
+  // No stored hash for this block, so read one first-hand for the next run's witness.
+  const header = await rpc.getBlockHeader(cut);
+  requests += 1;
   return {
-    cut: null,
-    cutHash: null,
-    boundReached: candidates.length >= MAX_REORG_WALKBACK,
+    cut,
+    cutHash: header.hash,
+    reason: candidates.length === 0 ? 'no-indexed-data' : 'bounded-window',
     examined,
     requests,
   };

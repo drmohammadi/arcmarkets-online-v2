@@ -1,13 +1,16 @@
 import { expect } from "chai";
+import { custom, numberToHex, type EIP1193RequestFn } from "viem";
 import { closePool, getPool } from "../../frontend/lib/db/pool";
 import {
   acquireLease,
   ensureIndexerState,
   readIndexerState,
   releaseLease,
+  type BlockRow,
 } from "../../frontend/lib/db/queries";
 import { MIN_CHUNK } from "../../frontend/lib/indexer/chunking";
 import type { IndexedEvent } from "../../frontend/lib/indexer/replay";
+import { createIndexerRpc } from "../../frontend/lib/indexer/rpc";
 import {
   LEASE_SECONDS,
   MAX_REORG_WALKBACK,
@@ -21,6 +24,7 @@ import {
   headerBudget,
   missingBlockNumbers,
   normalizeChainSettings,
+  probeReorgCut,
   runIndexer,
   toCount,
 } from "../../frontend/lib/indexer/run";
@@ -78,6 +82,46 @@ function ev(fpmm: string, blockNumber: number, logIndex: number): IndexedEvent {
 }
 
 const nums = (list: readonly bigint[]): string[] => list.map((n) => n.toString());
+
+/** A stored `blocks` row: block number plus the hash we recorded for it. */
+function stored(blockNumber: number, hash: string): BlockRow {
+  return { blockNumber: BigInt(blockNumber), blockHash: hash, blockTime: new Date(0) };
+}
+
+const hash32 = (seed: number): string => "0x" + seed.toString(16).padStart(64, "0");
+
+/**
+ * A real `IndexerRpc` over viem's `custom()` transport — the same seam
+ * `IndexerRpc.test.ts` uses — answering `eth_getBlockByNumber` from `chainHashes`.
+ *
+ * Driving the probe through the transport rather than through a hand-rolled fake
+ * keeps the hash normalization (`rpc.ts` lowercases) and the block-not-found path
+ * inside the test's reach. `retryCount: 0` so one request is one request.
+ */
+function chainAt(chainHashes: Record<string, string>) {
+  const asked: string[] = [];
+  const request = (async (args: { method: string; params?: unknown }) => {
+    if (args.method !== "eth_getBlockByNumber") throw new Error(`unexpected ${args.method}`);
+    const [blockTag] = (args.params ?? []) as string[];
+    const number = BigInt(blockTag).toString();
+    asked.push(number);
+    const hash = chainHashes[number];
+    if (!hash) return null;
+    return {
+      number: numberToHex(BigInt(number)),
+      hash,
+      parentHash: hash32(0),
+      timestamp: numberToHex(BigInt(1_756_651_200)),
+      transactions: [],
+    };
+  }) as unknown as EIP1193RequestFn;
+  return {
+    asked,
+    rpc: createIndexerRpc("https://rpc.invalid/never-called", MIN_CHUNK, {
+      transport: custom({ request }, { retryCount: 0 }),
+    }),
+  };
+}
 
 describe("indexer run: safe head", () => {
   it("holds back exactly `confirmations` blocks", () => {
@@ -350,11 +394,111 @@ describe("indexer run: chain settings", () => {
   });
 });
 
+describe("indexer run: reorg probe", () => {
+  // Arc testnet's real shape: the factory at 55.632M, trades clustered near
+  // 55.7M, the head past 57.3M. The gap between the last event-bearing block and
+  // the checkpoint is what the old walk-back threw away.
+  const ANCHOR = BigInt(55_632_013);
+  const CURSOR = BigInt(57_300_000);
+  const BOUND = CURSOR - BigInt(MAX_REORG_WALKBACK);
+  const CUT_HASH = hash32(0xcc);
+
+  it("cuts within the bound when the highest stored block is far below and still matches", async () => {
+    // THE REGRESSION. `blocks` holds only event-bearing blocks, so cutting at "the
+    // highest stored block that matches" rewinds 1.6M blocks for a one-block tip
+    // reorg and silently redoes the whole backfill.
+    const { rpc } = chainAt({
+      "55700000": hash32(1),
+      [BOUND.toString()]: CUT_HASH,
+    });
+    const probe = await probeReorgCut(rpc, [stored(55_700_000, hash32(1))], CURSOR, ANCHOR);
+    expect(probe.cut).to.equal(BOUND);
+    expect(probe.cutHash).to.equal(CUT_HASH);
+    expect(probe.reason).to.equal("bounded-window");
+    expect(toCount(CURSOR - probe.cut!)).to.equal(MAX_REORG_WALKBACK);
+  });
+
+  it("does not rewind to the anchor merely because no event-bearing block is stored", async () => {
+    // An empty candidate list proves no EVENT block was stored, not that no common
+    // ancestor exists. There is also nothing to invalidate: every markets row's
+    // created_block and every market_events row's block is in `blocks`.
+    const { rpc } = chainAt({ [BOUND.toString()]: CUT_HASH });
+    const probe = await probeReorgCut(rpc, [], CURSOR, ANCHOR);
+    expect(probe.cut).to.equal(BOUND);
+    expect(probe.reason).to.equal("no-indexed-data");
+    expect(probe.cut).to.not.equal(ANCHOR - BigInt(1));
+  });
+
+  it("prefers a proven ancestor over the bound when it is higher", async () => {
+    const { rpc, asked } = chainAt({ "57299998": hash32(2) });
+    const probe = await probeReorgCut(rpc, [stored(57_299_998, hash32(2))], CURSOR, ANCHOR);
+    expect(probe.cut).to.equal(BigInt(57_299_998));
+    expect(probe.cutHash).to.equal(hash32(2));
+    expect(probe.reason).to.equal("verified-ancestor");
+    // One request: the verified candidate. Its hash is already first-hand.
+    expect(asked).to.deep.equal(["57299998"]);
+  });
+
+  it("cuts strictly below every stored block the chain disagrees with", async () => {
+    const { rpc } = chainAt({
+      // The chain's hashes for the two highest stored blocks differ from ours.
+      "57299999": hash32(0xaa),
+      "57299998": hash32(0xbb),
+      "57299990": hash32(3),
+    });
+    const probe = await probeReorgCut(
+      rpc,
+      [stored(57_299_999, hash32(9)), stored(57_299_998, hash32(8)), stored(57_299_990, hash32(3))],
+      CURSOR,
+      ANCHOR
+    );
+    expect(probe.cut).to.equal(BigInt(57_299_990));
+    expect(probe.cut! < BigInt(57_299_998)).to.equal(true);
+    expect(probe.reason).to.equal("verified-ancestor");
+  });
+
+  it("refuses to truncate when the disagreement is deeper than the bound", async () => {
+    // A stored block 1.6M blocks down that no longer matches is not a reorg — it is
+    // a rewritten or reset chain. Report; delete nothing.
+    const { rpc } = chainAt({ "55700000": hash32(0xdd) });
+    const probe = await probeReorgCut(rpc, [stored(55_700_000, hash32(1))], CURSOR, ANCHOR);
+    expect(probe.cut).to.equal(null);
+    expect(probe.cutHash).to.equal(null);
+    expect(probe.reason).to.equal("too-deep");
+  });
+
+  it("bounds its work and still refuses when nothing matches", async () => {
+    const candidates: BlockRow[] = [];
+    const chainHashes: Record<string, string> = {};
+    for (let i = 0; i < MAX_REORG_WALKBACK; i += 1) {
+      const n = 57_299_999 - i * 3;
+      candidates.push(stored(n, hash32(i + 1)));
+      chainHashes[n.toString()] = hash32(0x10000 + i);
+    }
+    const { rpc } = chainAt(chainHashes);
+    const probe = await probeReorgCut(rpc, candidates, CURSOR, ANCHOR);
+    expect(probe.cut).to.equal(null);
+    expect(probe.reason).to.equal("too-deep");
+    expect(probe.requests).to.be.at.most(MAX_REORG_WALKBACK + 1);
+  });
+
+  it("reports a full rewind when the whole indexed span is inside the window", async () => {
+    // The only case that still reaches the anchor: the checkpoint is within the
+    // bound of it, so the rewind is trivial — but it is reported, never quiet.
+    const { rpc } = chainAt({ "1050": hash32(0xee) });
+    const probe = await probeReorgCut(rpc, [stored(1050, hash32(4))], BigInt(1100), BigInt(1000));
+    expect(probe.cut).to.equal(BigInt(999));
+    expect(probe.cutHash).to.equal(null);
+    expect(probe.reason).to.equal("full-rewind");
+  });
+});
+
 describe("indexer run: stated bounds", () => {
   it("bounds the reorg walk-back at 256 stored blocks", () => {
-    // Unbounded, a chain that disagrees everywhere would spend thousands of
-    // requests and fail anyway. Past the bound the run reports and truncates
-    // NOTHING, rather than deleting a whole history on a guess.
+    // Two roles, one number: at most this many stored blocks are probed, and a
+    // fork deeper than this many blocks below the checkpoint is reported rather
+    // than cut. The second is the same kind of assumption as `confirmations` (12),
+    // 21x more conservative, and it is contradicted loudly rather than assumed.
     expect(MAX_REORG_WALKBACK).to.equal(256);
   });
 
@@ -391,6 +535,9 @@ describe("indexer run: runIndexer never throws", () => {
     expect(result.eventsInserted).to.equal(0);
     expect(result.ranBlocks).to.equal(BigInt(0));
     expect(result.checksumFailures).to.equal(0);
+    // No range was ever established, so "no progress" is not the right complaint —
+    // the failure is. Those two must not be conflated either.
+    expect(result.noProgress).to.equal(false);
     // An empty range, not a range covering fromBlock.
     expect(result.toBlock < result.fromBlock).to.equal(true);
   });
@@ -456,6 +603,9 @@ dbSuite("indexer run loop against the database (needs DATABASE_URL)", () => {
     expect(result.error).to.be.a("string");
     expect(result.eventsInserted).to.equal(0);
     expect(result.ranBlocks).to.equal(BigInt(0));
+    // The head read failed, so no range was ever established: the failure is the
+    // complaint, not "no progress".
+    expect(result.noProgress).to.equal(false);
 
     const state = await readIndexerState(SYNTH_CHAIN);
     expect(state).to.not.equal(null);
