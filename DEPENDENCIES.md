@@ -163,3 +163,71 @@
 
   **Audit note.** Because no package was added, removed or upgraded, `npm audit`'s result
   is unchanged from the previous entry — no new advisories were introduced by this change.
+
+  ### Added in the chart-indexer change: `pg`, `@vercel/functions`, `@types/pg`
+
+  This change adds a server-side blockchain indexer, a Postgres trade index and a chart API.
+  It is the **first change to add a runtime dependency to the frontend since the initial
+  build**, and it deliberately reverses two "Deliberately NOT added" rows above
+  (`a database / ORM` and `a subgraph / indexer`). The reversal is recorded rather than
+  quietly overwritten, because the reason those rows existed is still half-true.
+
+  **What changed since that rejection.** The rejection rested on "Vercel serverless has no
+  persistent disk," which argues against a database *on the deploy target*. It does not argue
+  against a **managed Postgres reached over the network**, which is what this uses. The
+  pressure that forced the change is in CLAUDE.md: Arc testnet's head is 1.7M blocks past the
+  factory's deploy block, `eth_getLogs` refuses ranges at 1,048,576 blocks, and the public RPC
+  rate-limits hard — so a browser-side sweep can only ever be a *growing window* over the
+  history, never the whole of it. Indexing once on the server and serving the result is the
+  fix. The ORM half of the rejection still stands: no Prisma, no Drizzle.
+
+  ### pg `8.23.0`
+  - **Why chosen:** the reference Postgres client for Node. Plain SQL, no schema DSL, no
+    codegen step, no build-time coupling — the migration is a `.sql`-shaped string and the
+    queries are parameterized text, which is directly auditable in review.
+  - **Why secure:** maintained since 2010 with an enormous user base; pure JavaScript with no
+    native addon to compile or trust (`pg-native` is optional and NOT installed). It supports
+    `$1`-style **parameterized queries**, which is how this project satisfies its own
+    "parameterized queries by default" rule — no string-concatenated SQL anywhere.
+    `npm audit` reports **no advisory against `pg` or any of its transitive packages**; all 25
+    pre-existing advisories in this repo belong to the hardhat/walletconnect trees, and the
+    count is identical before and after this install.
+  - **Better than alternatives:** **`postgres` (porsager)** is smaller and faster but its
+    tagged-template API makes it visually hard to tell a parameterized query from an
+    interpolated one during review — the wrong tradeoff for a repo whose standing rules are
+    about auditability. **`prisma`/`drizzle`** add a schema language, a generate step and a
+    much larger install for a schema of three tables. **`@vercel/postgres`** wraps `pg` but
+    binds the code to one host; `pg` keeps the provider swappable.
+  - **7-day:** published **2026-08-08**, verified with `npm view pg time --json` — 24 days old
+    as of 2026-09-01. Passes.
+
+  ### @vercel/functions `3.9.5`
+  - **Why chosen:** provides `waitUntil()`, the only supported way to let a serverless response
+    return while indexing work continues. Without it the choice is to hold a visitor's request
+    open for the whole sweep or to have the runtime kill the work mid-write.
+  - **Why secure:** first-party Vercel package for the actual deploy target, so it is versioned
+    against the runtime rather than guessing at it. Tiny surface — the indexer uses it through
+    one seam, so the dependency is contained and mockable in tests. No advisories.
+  - **Better than alternatives:** a bare floating promise is exactly what `waitUntil` exists to
+    replace — the sandbox may freeze immediately after the response, truncating the write. A
+    long-lived worker (BullMQ, a container) means another service and another host to trust.
+  - **7-day:** published **2026-08-20**, verified with `npm view @vercel/functions time --json`
+    — 12 days old as of 2026-09-01. Passes.
+
+  ### @types/pg `8.11.10` (devDependency)
+  - **Why chosen:** `pg` ships no bundled types, and `frontend/tsconfig.json` is `strict: true`,
+    so untyped query results would be `any` at exactly the boundary where numeric precision
+    matters (Postgres `numeric`/`bigint` arrive as strings).
+  - **Why secure:** DefinitelyTyped; types are erased at compile time and ship no runtime code,
+    so it cannot execute anything in production.
+  - **Better than alternatives:** hand-written ambient declarations would drift from `pg`.
+  - **7-day:** published **2024-09-13** — about two years old. Passes with margin.
+    Pinned at 8.11.10 rather than the current 8.23.1 because `@types/*` versions track the
+    library's API surface, not its version number, and 8.11.10 already covers everything used
+    here; the newer types are not required and are the less-proven pin.
+
+  **Not added, despite the new backend:** no ORM, no query builder, no migration framework
+  (`db/migrate.ts` is a plain script over `pg`), no validation library (the route handlers
+  reuse the existing dependency-free validators), and no separate cron service (Vercel Cron is
+  configuration, not a package). The `db:migrate` script runs through `npx tsx`, which is
+  fetched on demand rather than installed, so it adds nothing to the dependency tree.
