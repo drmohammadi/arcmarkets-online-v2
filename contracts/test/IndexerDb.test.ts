@@ -1,4 +1,5 @@
 import { expect } from "chai";
+import type { PoolClient } from "pg";
 import { closePool, getPool, sslConfigFor, withTx } from "../../frontend/lib/db/pool";
 import {
   acquireLease,
@@ -62,9 +63,13 @@ if (!HAS_DB) {
 
 /** Negative, so it cannot collide with chain 5042002, 31337 or any other. */
 const CHAIN = -5042002;
+/** A second synthetic chain, so the anchor tests cannot disturb the rest. */
+const CHAIN_ALT = -5042003;
 const FACTORY = "0x1111111111111111111111111111111111111111";
 const POOL_A = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const POOL_B = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const POOL_C = "0xcccccccccccccccccccccccccccccccccccccccc";
+const POOL_E = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 const TRADER = "0xdddddddddddddddddddddddddddddddddddddddd";
 const START_BLOCK = BigInt(1000);
 
@@ -101,6 +106,21 @@ function event(over: Partial<MarketEventInsert> & { blockNumber: bigint; logInde
   };
 }
 
+/** A `MarketCreated` row with only the fields a test varies. */
+function market(questionId: bigint, fpmm: string, blockNumber: bigint): MarketCreatedRow {
+  return {
+    questionId,
+    fpmm,
+    conditionId: hash32(Number(questionId)),
+    question: "q",
+    category: "c",
+    resolutionTime: BigInt(1_800_000_000),
+    resolver: TRADER,
+    feeBps: 100,
+    blockNumber,
+  };
+}
+
 /**
  * No database needed: the SSL decision is pure. It is tested because getting it
  * wrong is invisible — an `ssl` object passed alongside a URL carrying
@@ -132,13 +152,175 @@ describe("db pool ssl policy", () => {
   });
 });
 
-/** Deletes ONLY this suite's synthetic chain. Qualified, per-table, by key. */
+/**
+ * NO DATABASE. This is where the carried acceptance criterion is pinned
+ * UNCONDITIONALLY.
+ *
+ * The round-trip test below proves the column and the driver behave, but it only
+ * runs when someone has exported `DATABASE_URL` — nothing loads
+ * `frontend/.env.local` for the test suite — so on its own it would let a
+ * regression to `execYesBps || null` ship green through a normal `npm test`.
+ * This test drives the real `insertMarketEvents` through a fake client and
+ * asserts the BOUND PARAMETER ARRAY it builds, so the invariant is checked on
+ * every run, everywhere, with no database at all.
+ *
+ * It also asserts the shape of the statement itself: 17 placeholders per row in
+ * `$n` form, ON CONFLICT DO NOTHING at the end, and every amount and block
+ * number carried as a decimal STRING rather than a `number`.
+ */
+describe("market_events insert parameters (no database)", () => {
+  /** The column order of the INSERT, so an index assertion reads as a name. */
+  const COL = {
+    chainId: 0,
+    blockNumber: 1,
+    logIndex: 2,
+    txHash: 3,
+    questionId: 4,
+    fpmm: 5,
+    kind: 6,
+    actor: 7,
+    outcome: 8,
+    collateral: 9,
+    shares: 10,
+    reserveYes: 11,
+    reserveNo: 12,
+    totalSupply: 13,
+    yesBps: 14,
+    execYesBps: 15,
+    blockTime: 16,
+  };
+  const WIDTH = 17;
+
+  interface Captured {
+    text: string;
+    params: unknown[];
+  }
+
+  /** A PoolClient that records instead of connecting. */
+  function recordingClient(into: Captured[]): PoolClient {
+    return {
+      query: async (text: string, params?: unknown[]) => {
+        into.push({ text, params: params ?? [] });
+        return { rowCount: (params?.length ?? 0) / WIDTH };
+      },
+    } as unknown as PoolClient;
+  }
+
+  it("binds exec_yes_bps 0 as the number 0, and null as null", async () => {
+    const captured: Captured[] = [];
+    const inserted = await insertMarketEvents(recordingClient(captured), CHAIN, [
+      event({ blockNumber: BigInt(1001), logIndex: 0, outcome: 1, execYesBps: 0 }),
+      event({
+        blockNumber: BigInt(1001),
+        logIndex: 1,
+        kind: "liquidity_added",
+        outcome: null,
+        execYesBps: null,
+      }),
+    ]);
+    expect(captured.length).to.equal(1);
+    const params = captured[0].params;
+    expect(params.length).to.equal(2 * WIDTH);
+    expect(inserted).to.equal(2);
+
+    // THE invariant: a real execution price of 0 must survive as 0. Under
+    // `execYesBps || null` this slot would be null and nothing else would fail.
+    const zero = params[COL.execYesBps];
+    expect(zero).to.equal(0);
+    expect(zero).to.not.equal(null);
+    expect(typeof zero).to.equal("number");
+    // A genuine absence still binds null.
+    expect(params[WIDTH + COL.execYesBps]).to.equal(null);
+    // The neighbouring nullable column behaves the same way: outcome 0 is YES.
+    expect(params[COL.outcome]).to.equal(1);
+    expect(params[WIDTH + COL.outcome]).to.equal(null);
+  });
+
+  it("carries every amount and block number as a string, never a number", async () => {
+    const captured: Captured[] = [];
+    const huge = BigInt(2) ** BigInt(200);
+    await insertMarketEvents(recordingClient(captured), CHAIN, [
+      event({
+        blockNumber: BigInt(57_301_912),
+        logIndex: 3,
+        questionId: BigInt(9),
+        collateral: huge,
+        shares: huge - BigInt(1),
+        reserveYes: huge,
+        reserveNo: huge,
+        totalSupply: huge,
+      }),
+    ]);
+    const params = captured[0].params;
+    for (const key of [
+      "blockNumber",
+      "questionId",
+      "collateral",
+      "shares",
+      "reserveYes",
+      "reserveNo",
+      "totalSupply",
+    ] as const) {
+      expect(typeof params[COL[key]], key).to.equal("string");
+    }
+    expect(params[COL.collateral]).to.equal(huge.toString());
+    expect(params[COL.blockNumber]).to.equal("57301912");
+    // Small integers that DO fit a number stay numbers: they are counts and
+    // indexes, not amounts.
+    expect(typeof params[COL.logIndex]).to.equal("number");
+    expect(typeof params[COL.yesBps]).to.equal("number");
+    expect(params[COL.blockTime]).to.be.instanceOf(Date);
+  });
+
+  it("emits one parameterized tuple per row and ends with DO NOTHING", async () => {
+    const captured: Captured[] = [];
+    const rows = [0, 1, 2].map((i) => event({ blockNumber: BigInt(1001), logIndex: i }));
+    await insertMarketEvents(recordingClient(captured), CHAIN, rows);
+    const { text, params } = captured[0];
+    expect(params.length).to.equal(3 * WIDTH);
+    // Every value is a placeholder: $1..$51, in order, and nothing else.
+    const placeholders = text.match(/\$\d+/g) ?? [];
+    expect(placeholders.length).to.equal(3 * WIDTH);
+    expect(placeholders).to.deep.equal(
+      Array.from({ length: 3 * WIDTH }, (_unused, i) => `$${i + 1}`)
+    );
+    expect(text).to.contain(
+      "ON CONFLICT (chain_id, block_number, log_index) DO NOTHING"
+    );
+    // No literal from a row leaked into the SQL.
+    expect(text).to.not.contain(TRADER);
+    expect(text).to.not.contain("buy");
+  });
+
+  it("splits at 500 rows, and never truncates the batch", async () => {
+    // 500 x 17 = 8500 parameters, inside Postgres's 65535 limit; 501 rows must
+    // be two statements, with every row present exactly once.
+    const captured: Captured[] = [];
+    const rows = Array.from({ length: 501 }, (_unused, i) =>
+      event({ blockNumber: BigInt(2000), logIndex: i })
+    );
+    const inserted = await insertMarketEvents(recordingClient(captured), CHAIN, rows);
+    expect(captured.length).to.equal(2);
+    expect(captured[0].params.length).to.equal(500 * WIDTH);
+    expect(captured[1].params.length).to.equal(1 * WIDTH);
+    expect(inserted).to.equal(501);
+    const indexes = captured.flatMap((c) =>
+      c.params.filter((_unused, i) => i % WIDTH === COL.logIndex)
+    );
+    expect(indexes.length).to.equal(501);
+    expect(new Set(indexes).size).to.equal(501);
+  });
+});
+
+/** Deletes ONLY this suite's synthetic chains. Qualified, per-table, by key. */
 async function cleanup(): Promise<void> {
   const db = getPool();
-  await db.query("DELETE FROM market_events WHERE chain_id = $1", [CHAIN]);
-  await db.query("DELETE FROM blocks WHERE chain_id = $1", [CHAIN]);
-  await db.query("DELETE FROM markets WHERE chain_id = $1", [CHAIN]);
-  await db.query("DELETE FROM indexer_state WHERE chain_id = $1", [CHAIN]);
+  for (const chain of [CHAIN, CHAIN_ALT]) {
+    await db.query("DELETE FROM market_events WHERE chain_id = $1", [chain]);
+    await db.query("DELETE FROM blocks WHERE chain_id = $1", [chain]);
+    await db.query("DELETE FROM markets WHERE chain_id = $1", [chain]);
+    await db.query("DELETE FROM indexer_state WHERE chain_id = $1", [chain]);
+  }
 }
 
 suite("indexer database round-trip (needs DATABASE_URL)", () => {
@@ -148,8 +330,14 @@ suite("indexer database round-trip (needs DATABASE_URL)", () => {
   });
 
   after(async () => {
-    await cleanup();
-    await closePool();
+    // Guarded: a cleanup failure must not skip the close, or an open pool keeps
+    // the event loop alive and mocha never exits. Both failures are reported —
+    // the finally block cannot swallow the first one.
+    try {
+      await cleanup();
+    } finally {
+      await closePool();
+    }
   });
 
   it("round-trips exec_yes_bps 0 as 0, and null as NULL", async () => {
@@ -183,23 +371,18 @@ suite("indexer database round-trip (needs DATABASE_URL)", () => {
   });
 
   it("inserts each log exactly once, without help from the lease", async () => {
-    // Same two rows again, no lease involved anywhere.
-    const again = await withTx((c) =>
-      insertMarketEvents(c, CHAIN, [
-        event({ blockNumber: BigInt(1001), logIndex: 0, outcome: 1, execYesBps: 0 }),
-        event({
-          blockNumber: BigInt(1001),
-          logIndex: 1,
-          kind: "liquidity_added",
-          outcome: null,
-          execYesBps: null,
-        }),
-      ])
-    );
-    expect(again).to.equal(0);
+    // Self-contained: its own question id and block, inserted twice here rather
+    // than relying on the test above having run.
+    const rows = [
+      event({ blockNumber: BigInt(1010), logIndex: 0, questionId: BigInt(13) }),
+      event({ blockNumber: BigInt(1010), logIndex: 1, questionId: BigInt(13) }),
+    ];
+    expect(await withTx((c) => insertMarketEvents(c, CHAIN, rows))).to.equal(2);
+    // No lease is taken anywhere in this test: idempotency must stand alone.
+    expect(await withTx((c) => insertMarketEvents(c, CHAIN, rows))).to.equal(0);
     const res = await getPool().query<{ n: string }>(
-      "SELECT count(*) AS n FROM market_events WHERE chain_id = $1",
-      [CHAIN]
+      "SELECT count(*) AS n FROM market_events WHERE chain_id = $1 AND question_id = $2",
+      [CHAIN, "13"]
     );
     expect(res.rows[0].n).to.equal("2");
   });
@@ -312,6 +495,58 @@ suite("indexer database round-trip (needs DATABASE_URL)", () => {
     // The original row is untouched.
     const state = await readIndexerState(CHAIN);
     expect(state!.startBlock).to.equal(START_BLOCK);
+  });
+
+  /** Rebuild CHAIN_ALT's state row from scratch, so each anchor test stands alone. */
+  async function bootstrapAlt(start: bigint): Promise<void> {
+    await getPool().query("DELETE FROM indexer_state WHERE chain_id = $1", [CHAIN_ALT]);
+    await ensureIndexerState(CHAIN_ALT, FACTORY, start);
+  }
+
+  it("lowers a corrected anchor and rewinds an untouched checkpoint", async () => {
+    // The case CLAUDE.md is scarred by: an operator discovers the anchor is
+    // wrong and fixes the deployments entry. Ignoring that would leave the
+    // floor above the real deploy block, hiding trades silently.
+    await bootstrapAlt(BigInt(5000));
+    await ensureIndexerState(CHAIN_ALT, FACTORY, BigInt(4000));
+    const state = await readIndexerState(CHAIN_ALT);
+    expect(state!.startBlock).to.equal(BigInt(4000));
+    expect(state!.lastIndexedBlock).to.equal(BigInt(3999));
+  });
+
+  it("lowers the anchor but keeps a checkpoint that has already advanced", async () => {
+    await bootstrapAlt(BigInt(5000));
+    await withTx((c) => commitCheckpoint(c, CHAIN_ALT, BigInt(5500), hash32(5500), null, false));
+    await ensureIndexerState(CHAIN_ALT, FACTORY, BigInt(4000));
+    const state = await readIndexerState(CHAIN_ALT);
+    expect(state!.startBlock).to.equal(BigInt(4000));
+    // Dragging the checkpoint below indexed blocks would make the run loop fold
+    // re-discovered early events onto a LATER replay tail — wrong reserves.
+    expect(state!.lastIndexedBlock).to.equal(BigInt(5500));
+  });
+
+  it("refuses to raise the anchor, leaving the stored floor alone", async () => {
+    await bootstrapAlt(BigInt(5000));
+    await ensureIndexerState(CHAIN_ALT, FACTORY, BigInt(9000));
+    const state = await readIndexerState(CHAIN_ALT);
+    expect(state!.startBlock).to.equal(BigInt(5000));
+    expect(state!.lastIndexedBlock).to.equal(BigInt(4999));
+  });
+
+  it("distinguishes a contended lease from a missing state row", async () => {
+    await getPool().query("DELETE FROM indexer_state WHERE chain_id = $1", [CHAIN_ALT]);
+    let message = "";
+    try {
+      await acquireLease(CHAIN_ALT, "owner-a", 60);
+    } catch (err) {
+      message = err instanceof Error ? err.message : String(err);
+    }
+    // A bare null here would make an un-bootstrapped chain look permanently busy.
+    expect(message).to.contain("no indexer_state row");
+    await bootstrapAlt(BigInt(5000));
+    expect(await acquireLease(CHAIN_ALT, "owner-a", 60)).to.not.equal(null);
+    expect(await acquireLease(CHAIN_ALT, "owner-b", 60)).to.equal(null);
+    await releaseLease(CHAIN_ALT, "owner-a");
   });
 
   it("advances the checkpoint and never forgets a learned chunk ceiling", async () => {
@@ -470,24 +705,71 @@ suite("indexer database round-trip (needs DATABASE_URL)", () => {
   });
 
   it("truncates above a reorg cut, including a resolution that never happened", async () => {
-    await withTx((c) => truncateAbove(c, CHAIN, BigInt(1002)));
+    // Seeds everything it asserts on — its own blocks (3000-3002), its own two
+    // markets and its own pools — so it does not depend on any other test having
+    // run, and its assertions are scoped to those keys.
+    const CUT = BigInt(3000);
+    await withTx(async (c) => {
+      await upsertBlocks(c, CHAIN, [
+        { blockNumber: BigInt(3000), blockHash: hash32(3000), blockTime: at(3000) },
+        { blockNumber: BigInt(3001), blockHash: hash32(3001), blockTime: at(3001) },
+        { blockNumber: BigInt(3002), blockHash: hash32(3002), blockTime: at(3002) },
+      ]);
+      await upsertMarkets(
+        c,
+        CHAIN,
+        [
+          market(BigInt(14), POOL_C, BigInt(3000)),
+          market(BigInt(15), POOL_E, BigInt(3002)),
+        ],
+        new Map([
+          ["3000", at(3000)],
+          ["3002", at(3002)],
+        ])
+      );
+      await markResolved(c, CHAIN, [
+        {
+          questionId: BigInt(14),
+          payoutYes: BigInt(1),
+          payoutNo: BigInt(0),
+          blockNumber: BigInt(3002),
+        },
+      ]);
+      await insertMarketEvents(c, CHAIN, [
+        event({
+          blockNumber: BigInt(3000),
+          logIndex: 0,
+          questionId: BigInt(14),
+          fpmm: POOL_C,
+          reserveYes: BigInt(31),
+          reserveNo: BigInt(32),
+          totalSupply: BigInt(33),
+        }),
+        event({ blockNumber: BigInt(3001), logIndex: 0, questionId: BigInt(14), fpmm: POOL_C }),
+        event({ blockNumber: BigInt(3002), logIndex: 7, questionId: BigInt(14), fpmm: POOL_C }),
+      ]);
+    });
+
+    await withTx((c) => truncateAbove(c, CHAIN, CUT));
 
     const events = await getPool().query<{ block_number: string }>(
-      "SELECT block_number FROM market_events WHERE chain_id = $1 ORDER BY block_number",
-      [CHAIN]
+      `SELECT block_number FROM market_events
+        WHERE chain_id = $1 AND question_id = $2 ORDER BY block_number`,
+      [CHAIN, "14"]
     );
-    expect(events.rows.map((r) => r.block_number)).to.deep.equal(["1001", "1001", "1002"]);
+    expect(events.rows.map((r) => r.block_number)).to.deep.equal(["3000"]);
 
     const blocks = await getPool().query<{ block_number: string }>(
-      "SELECT block_number FROM blocks WHERE chain_id = $1 ORDER BY block_number",
-      [CHAIN]
+      `SELECT block_number FROM blocks
+        WHERE chain_id = $1 AND block_number >= $2 ORDER BY block_number`,
+      [CHAIN, CUT.toString()]
     );
-    expect(blocks.rows.map((r) => r.block_number)).to.deep.equal(["1001", "1002"]);
+    expect(blocks.rows.map((r) => r.block_number)).to.deep.equal(["3000"]);
 
     // Created above the cut: gone, to be re-inserted when re-indexed.
-    const remaining = await questionIdByFpmm(CHAIN);
-    expect(remaining.size).to.equal(1);
-    expect(remaining.get(POOL_A)).to.equal(BigInt(9));
+    const byFpmm = await questionIdByFpmm(CHAIN);
+    expect(byFpmm.get(POOL_C)).to.equal(BigInt(14));
+    expect(byFpmm.has(POOL_E)).to.equal(false);
 
     // Resolved above the cut: un-resolved. Market rows are keyed by question
     // id, not by block, so nothing else would ever undo this.
@@ -498,15 +780,18 @@ suite("indexer database round-trip (needs DATABASE_URL)", () => {
     }>(
       `SELECT resolved, resolved_block, payout_yes FROM markets
         WHERE chain_id = $1 AND question_id = $2`,
-      [CHAIN, "9"]
+      [CHAIN, "14"]
     );
     expect(row.rows[0].resolved).to.equal(false);
     expect(row.rows[0].resolved_block).to.equal(null);
     expect(row.rows[0].payout_yes).to.equal(null);
 
-    // And the replay can resume from the surviving row below the cut.
-    const state = await latestReplayState(CHAIN, BigInt(8));
-    expect(state!.reserveYes).to.equal(BigInt(2) ** BigInt(200));
+    // And the replay resumes from the surviving row below the cut.
+    expect(await latestReplayState(CHAIN, BigInt(14))).to.deep.equal({
+      reserveYes: BigInt(31),
+      reserveNo: BigInt(32),
+      totalSupply: BigInt(33),
+    });
   });
 
   it("writes a 500-row batch in one statement", async () => {

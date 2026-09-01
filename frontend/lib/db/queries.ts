@@ -136,9 +136,20 @@ function toBigIntOrNull(value: string | number | bigint | null): bigint | null {
  */
 const MAX_TIMESTAMP_SECONDS = BigInt('253402300799');
 
-function clampSeconds(value: bigint): bigint {
-  if (value < BigInt(0)) return BigInt(0);
-  return value > MAX_TIMESTAMP_SECONDS ? MAX_TIMESTAMP_SECONDS : value;
+/**
+ * Clamp is the right trade here, but it must never be SILENT: a market whose
+ * displayed resolution date is not the one the chain recorded is a real (if
+ * minor) discrepancy, and the only way anyone learns of it is this line. Warns
+ * only when a clamp actually fires, so a normal range logs nothing.
+ */
+function clampResolutionSeconds(value: bigint, chainId: number, questionId: bigint): bigint {
+  if (value >= BigInt(0) && value <= MAX_TIMESTAMP_SECONDS) return value;
+  const clamped = value < BigInt(0) ? BigInt(0) : MAX_TIMESTAMP_SECONDS;
+  console.warn(
+    `upsertMarkets: resolution_time ${value} is outside timestamptz range ` +
+      `(chain ${chainId}, question ${questionId}); stored as ${clamped}`
+  );
+  return clamped;
 }
 
 /** Errors are stored for an operator to read, not to archive. */
@@ -247,7 +258,8 @@ function toStateRow(raw: RawStateRow): IndexerStateRow {
 // ---------------------------------------------------------------------------
 
 /**
- * Create this chain's state row if it is absent, and verify the factory.
+ * Create this chain's state row if it is absent, and reconcile it with the
+ * configured factory and anchor.
  *
  * `last_indexed_block` starts at `start_block - 1`, so the first range begins
  * exactly at the factory's deploy block: the anchor CLAUDE.md insists on, and
@@ -261,6 +273,11 @@ function toStateRow(raw: RawStateRow): IndexerStateRow {
  * Redeploying the factory means the indexed data is about a chain state that no
  * longer exists, and clearing it is a deliberate operator act, not a side
  * effect of a boot check.
+ *
+ * The anchor is RECONCILED, and never silently ignored — CLAUDE.md's twice-bitten
+ * rule is that "a floor above the real deploy block is worse than none: it hides
+ * trades silently", so a state row that disagrees with the configured anchor
+ * must produce an action and a log line, not a no-op.
  */
 export async function ensureIndexerState(
   chainId: number,
@@ -268,20 +285,90 @@ export async function ensureIndexerState(
   startBlock: bigint
 ): Promise<void> {
   const wanted = factory.toLowerCase();
-  const res = await getPool().query<{ factory_address: string }>(
+  const res = await getPool().query<{
+    factory_address: string;
+    start_block: string;
+    last_indexed_block: string;
+  }>(
     `INSERT INTO indexer_state (chain_id, factory_address, start_block, last_indexed_block)
           VALUES ($1, $2, $3, $4)
      ON CONFLICT (chain_id) DO UPDATE SET updated_at = now()
-       RETURNING factory_address`,
+       RETURNING factory_address, start_block, last_indexed_block`,
     [chainId, wanted, startBlock.toString(), (startBlock - BigInt(1)).toString()]
   );
-  const stored = (res.rows[0]?.factory_address ?? '').toLowerCase();
+  const row = res.rows[0];
+  const stored = (row?.factory_address ?? '').toLowerCase();
   if (stored !== wanted) {
     throw new Error(
       `indexer_state for chain ${chainId} was built for factory ${stored}, not ${wanted} — ` +
         'clear this chain\'s indexed rows deliberately before re-pointing it'
     );
   }
+  await reconcileStartBlock(chainId, startBlock, toBigInt(row.start_block));
+}
+
+/**
+ * Bring a stored anchor into line with the configured one, loudly.
+ *
+ * LOWERING IS APPLIED. A smaller anchor is strictly more history, and it cannot
+ * corrupt anything: the sweep is forward-only from `last_indexed_block`, the
+ * primary key makes every re-read of a block idempotent, and no event can
+ * predate the factory's real deploy block whatever we record here.
+ *
+ * It also moves `last_indexed_block` down to the new floor — but ONLY while the
+ * row is still untouched (`last_indexed_block <= start_block - 1`), which is the
+ * case that matters: an operator who spots a wrong anchor and fixes it before
+ * the backfill has begun gets the corrected history, instead of a correction
+ * that changes nothing. On a chain already mid-backfill the checkpoint is left
+ * alone deliberately — dragging it below already-indexed blocks would make the
+ * run loop re-discover early events and fold them onto a LATER replay tail,
+ * writing wrong reserves. Re-indexing such a chain is an operator procedure
+ * (Task 14's runbook), and the log line below says so.
+ *
+ * RAISING IS REFUSED. Raising the floor is precisely the silent-truncation case:
+ * it can only hide trades. It is refused rather than thrown on because it cannot
+ * corrupt data — the checkpoint, not the anchor, decides what is scanned — and
+ * wedging the whole indexer over a config edit would be a worse failure than a
+ * loud refusal.
+ */
+async function reconcileStartBlock(
+  chainId: number,
+  configured: bigint,
+  stored: bigint
+): Promise<void> {
+  if (configured === stored) return;
+
+  if (configured > stored) {
+    console.error(
+      `indexer_state: REFUSING to raise chain ${chainId}'s start_block from ${stored} to ` +
+        `${configured}. A floor above the real deploy block hides trades silently. ` +
+        'The stored anchor is unchanged; correct the deployments entry or reset this chain.'
+    );
+    return;
+  }
+
+  const res = await getPool().query<{ last_indexed_block: string }>(
+    `UPDATE indexer_state
+        SET start_block = $2,
+            last_indexed_block =
+              CASE WHEN last_indexed_block <= start_block - 1
+                   THEN $2::bigint - 1
+                   ELSE last_indexed_block END,
+            updated_at = now()
+      WHERE chain_id = $1
+    RETURNING last_indexed_block`,
+    [chainId, configured.toString()]
+  );
+  const checkpoint = toBigIntOrNull(res.rows[0]?.last_indexed_block ?? null);
+  const rewound = checkpoint !== null && checkpoint === configured - BigInt(1);
+  console.warn(
+    `indexer_state: lowered chain ${chainId}'s start_block from ${stored} to ${configured}` +
+      (rewound
+        ? ' and rewound the checkpoint to the new floor (nothing was indexed yet).'
+        : `. The checkpoint stays at ${checkpoint}: blocks below it are NOT re-scanned ` +
+          'automatically, because re-discovered early events would be replayed onto a later ' +
+          'tail. Re-index this chain deliberately to pick up the earlier history.')
+  );
 }
 
 /**
@@ -297,6 +384,15 @@ export async function ensureIndexerState(
  * An expired lease is simply taken (`lease_until < now()`), which is the whole
  * point of a lease over a lock: a run killed mid-flight blocks nothing beyond
  * its own expiry.
+ *
+ * A MISSING STATE ROW IS NOT A CONTENDED LEASE, and the two must not share the
+ * `null`: an un-bootstrapped chain would otherwise look permanently busy, and
+ * the indexer would report "another run has it" forever with no other run in
+ * existence. It cannot happen after `ensureIndexerState`, so it means the row
+ * was deleted underneath us or the caller skipped the bootstrap — a loud error
+ * that `recordError` puts in `/api/indexer/status`'s `lastError`, rather than a
+ * silence that looks like healthy contention. The extra round trip is only paid
+ * on the rare no-take path.
  */
 export async function acquireLease(
   chainId: number,
@@ -317,7 +413,18 @@ export async function acquireLease(
     [chainId, owner, secs]
   );
   const row = res.rows[0];
-  return row ? toStateRow(row) : null;
+  if (row) return toStateRow(row);
+  const exists = await getPool().query(
+    'SELECT 1 FROM indexer_state WHERE chain_id = $1',
+    [chainId]
+  );
+  if ((exists.rowCount ?? 0) === 0) {
+    throw new Error(
+      `acquireLease: no indexer_state row for chain ${chainId} — ` +
+        'call ensureIndexerState first (this is not a contended lease)'
+    );
+  }
+  return null;
 }
 
 /**
@@ -506,7 +613,7 @@ export async function upsertMarkets(
         r.conditionId.toLowerCase(),
         r.question,
         r.category,
-        clampSeconds(r.resolutionTime).toString(),
+        clampResolutionSeconds(r.resolutionTime, chainId, r.questionId).toString(),
         r.resolver.toLowerCase(),
         r.feeBps,
         r.blockNumber.toString(),
