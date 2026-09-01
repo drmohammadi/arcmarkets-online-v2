@@ -27,15 +27,20 @@
  *    can both fire on one message, `classifyRpcError` — not the booleans — is the
  *    entry point callers should use; it fixes the precedence once, here.
  *
- *    `isRateLimit` is a strict SUPERSET of `lib/rpcQueue.ts:76-92`, not a mirror
- *    of it: it also accepts a bare string, reads `statusCode`/`shortMessage`/
- *    `details`, and walks `error` as well as `cause`. So the indexer can back off
- *    where the browser will not — intended, since a missed 429 in a long
- *    server-side sweep is far more costly than one extra pause. The drift risk is
- *    ONE-DIRECTIONAL and unfixable by design: `rpcQueue`'s ladder and predicate
- *    are non-exported module state, and the zero-import rule forbids reading
- *    them, so a change on THAT side breaks no test here. Changing `rpcQueue`
- *    means changing this file by hand.
+ *    `isRateLimit` is DERIVED FROM `lib/rpcQueue.ts:76-92`, not a mirror of it and
+ *    no longer a superset either. It adds inputs that one does not look at (a bare
+ *    string, `statusCode`, viem's `shortMessage`/`details`, the `error` link as
+ *    well as `cause`), and it has one KNOWN INTENTIONAL DIVERGENCE: this file
+ *    matches `429` on a word boundary, while `rpcQueue.ts:87` still uses a bare
+ *    `msg.includes('429')` and therefore still calls
+ *    `"requested range too large: 55429000..55700000"` a rate limit in the browser
+ *    path. So the drift is BIDIRECTIONAL and deliberate on this side. It is also
+ *    unpinned: `rpcQueue`'s predicate and ladder are non-exported module state and
+ *    the zero-import rule forbids reading them from here, so nothing in this
+ *    module's tests notices a change made over there. Inconvenient, not
+ *    impossible — the TEST file has no zero-import rule and could read
+ *    `rpcQueue.ts` as text. Until something does, changing one side means
+ *    reviewing the other by hand.
  *
  * 2. **The learned ceiling only ever RISES.** `lib/logCache.ts:220-241` paid for
  *    this: `eth_getLogs` can be refused for RESULT COUNT as well as for range
@@ -68,9 +73,11 @@ const TWO = BigInt(2);
  * Backoff ladder for rate limits, in ms; its length also caps the retry count.
  *
  * Numerically identical to `lib/rpcQueue.ts:46` — copied, not shared, because
- * this module may not import. That copy can only drift in one direction: the
- * ladder there is a non-exported `const`, so the test that pins these four
- * numbers cannot notice a change made on that side. Edit both together.
+ * this module may not import. Nothing pins the two together: the ladder there is a
+ * non-exported `const`, so the test that pins these four numbers cannot see a
+ * change made on that side. That is inconvenient rather than impossible (the test
+ * file could read `rpcQueue.ts` as text and parse the ladder out), but until
+ * something does, edit both by hand together.
  */
 export const BACKOFF_MS: readonly number[] = [1000, 2000, 4000, 8000];
 
@@ -87,7 +94,7 @@ export const BACKOFF_MS: readonly number[] = [1000, 2000, 4000, 8000];
  * `maxRequests` blocks per run against a 1.7M-block history: the silent,
  * progressive emptiness `CLAUDE.md` warns about twice.
  *
- * `logCache.ts:231-232` avoids the same trap differently — it declines to store
+ * `logCache.ts:233` avoids the same trap differently — it declines to store
  * a non-positive value at all, leaving the ceiling UNKNOWN so the next sweep
  * uses its own default. A non-nullable `bigint` return cannot express "unknown",
  * so a stated floor is the closest faithful equivalent.
@@ -189,6 +196,11 @@ function chainHas(err: unknown, test: (e: unknown) => boolean, depth = 0): boole
  * than 10000 results"}` is a real Alchemy/Infura shape that satisfies both. That
  * is what `classifyRpcError` exists to settle — use it rather than calling these
  * two in an order you have to remember.
+ *
+ * @remarks Answers ONE question in isolation: "would a narrower range help?"
+ * Anything dispatching on error KIND must call `classifyRpcError` instead, because
+ * this and `isRateLimit` overlap and the order in which you ask decides the
+ * outcome. Direct use is legitimate when you genuinely only need this one bit.
  */
 export function isRangeTooLarge(err: unknown): boolean {
   return chainHas(err, (e) => {
@@ -224,12 +236,24 @@ export function isRangeTooLarge(err: unknown): boolean {
 /**
  * Detect a rate-limit rejection: the request was fine, there were too many.
  *
- * A strict superset of `lib/rpcQueue.ts:76-92` (bare strings, `statusCode`,
- * viem's `shortMessage`/`details`, the `error` link) — see rule 1 at the top for
- * why one-way divergence is intended and why no test can catch it.
+ * Derived from `lib/rpcQueue.ts:76-92` — see rule 1 at the top for what it adds
+ * (bare strings, `statusCode`, viem's `shortMessage`/`details`, the `error` link)
+ * and for the one intentional divergence: the `\b429\b` word-boundary match, which
+ * `rpcQueue.ts:87` does not have.
  *
- * Note what is NOT here: nothing about ranges or result counts. -32005 ("limit
- * exceeded") is a request-rate signal; a range refusal reports -32012 instead.
+ * THIS AND `isRangeTooLarge` CAN BOTH BE TRUE FOR THE SAME ERROR, and that is not
+ * a bug to fix here. `-32005` is a rate-limit code at some providers and a
+ * RESULT-COUNT refusal at others — Alchemy/Infura send
+ * `{code: -32005, message: "query returned more than 10000 results"}`, which this
+ * function reports as a rate limit (correctly, by code) and `isRangeTooLarge`
+ * reports as a range refusal (correctly, by message). The same goes for wording
+ * like "block range limit exceeded", which matches `limit exceeded` here.
+ *
+ * @remarks Answers ONE question in isolation: "is backing off a plausible remedy?"
+ * It does not tell you what KIND of failure this is. Anything dispatching on kind
+ * — retry versus narrow versus give up — must call `classifyRpcError`, which fixes
+ * the precedence (range-first) that the overlap above makes load-bearing. Direct
+ * use is legitimate when you genuinely only need this one bit.
  */
 export function isRateLimit(err: unknown): boolean {
   return chainHas(err, (e) => {
@@ -309,7 +333,7 @@ export function halve(span: bigint, minChunk: bigint): bigint | null {
  * limit: `current` is returned untouched when there is one, and `MIN_CHUNK` when
  * there is not. The result never goes below `MIN_CHUNK` — see that constant for
  * why returning `BigInt(1)` here was a ratchet lock that let a backfill cover
- * `maxRequests` blocks per run, and why `logCache.ts:231-232` expresses the same
+ * `maxRequests` blocks per run, and why `logCache.ts:233` expresses the same
  * rule by storing nothing at all.
  */
 export function nextChunkCeiling(current: bigint | null, accepted: bigint): bigint {
