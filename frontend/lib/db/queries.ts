@@ -155,6 +155,13 @@ function clampResolutionSeconds(value: bigint, chainId: number, questionId: bigi
 /** Errors are stored for an operator to read, not to archive. */
 const MAX_ERROR_CHARS = 2000;
 
+/**
+ * The maximum a Postgres `bigint` column can hold. Used as "no upper bound" where
+ * a block-number predicate must always be present: no chain can reach it, so the
+ * comparison is a tautology, and one statement shape beats a nullable predicate.
+ */
+const MAX_BIGINT = BigInt('9223372036854775807');
+
 // ---------------------------------------------------------------------------
 // Row types. Each mirrors its table's columns exactly — same names, same
 // order, one field per column — so a schema change and a type change are the
@@ -509,6 +516,65 @@ export async function recordError(chainId: number, message: string | null): Prom
   );
 }
 
+/**
+ * Move the checkpoint DOWN to `block` after a reorg truncation.
+ *
+ * Separate from `commitCheckpoint`, and not a variant of it, for three reasons:
+ *  - the hash may be NULL. When no stored block survives the walk-back the cut
+ *    is `start_block - 1`, an anchor we hold no header for; `commitCheckpoint`
+ *    takes a non-null hash because a committed range always has one.
+ *  - `backfill_complete` must go FALSE. Blocks the indexer had already covered
+ *    were just deleted, so a `true` left over from before the reorg would tell
+ *    `/api/indexer/status` the history is whole while a hole is being refilled.
+ *  - `last_error` is deliberately NOT cleared here. A reorg is a fact worth
+ *    reporting, and the run that follows this reset either commits (clearing it
+ *    through `commitCheckpoint`) or fails (setting its own).
+ *
+ * Takes a client: it must land in the same transaction as `truncateAbove`, or a
+ * crash between the two leaves rows above a checkpoint that claims to describe
+ * them — the exact permanent hole the single-transaction rule exists to prevent.
+ */
+export async function resetCheckpoint(
+  c: PoolClient,
+  chainId: number,
+  block: bigint,
+  hash: string | null
+): Promise<void> {
+  await c.query(
+    `UPDATE indexer_state
+        SET last_indexed_block = $2,
+            last_indexed_block_hash = $3,
+            backfill_complete = false,
+            updated_at = now()
+      WHERE chain_id = $1`,
+    [chainId, block.toString(), hash === null ? null : hash.toLowerCase()]
+  );
+}
+
+/**
+ * Persist a learned `eth_getLogs` range ceiling on its own.
+ *
+ * `commitCheckpoint` already carries the ceiling for a run that committed a
+ * range, and that is the normal path. This exists for the run that learned an
+ * accepted span but covered nothing contiguously (`coveredTo: null` alongside a
+ * non-null `acceptedSpan` — a legitimate combination when the request budget
+ * ends a sweep after a full-size chunk succeeded). Without it those requests are
+ * paid for and the answer thrown away, so the next run re-probes the same limit.
+ *
+ * The MONOTONIC rule lives in `lib/indexer/chunking.ts:nextChunkCeiling` and the
+ * caller must have folded through it already: this statement assigns, so handing
+ * it a smaller value WOULD lower the ceiling. It runs under the run lease, so
+ * there is no read-modify-write race to lose.
+ */
+export async function saveAcceptedChunk(chainId: number, chunk: bigint): Promise<void> {
+  await getPool().query(
+    `UPDATE indexer_state
+        SET accepted_chunk = $2, updated_at = now()
+      WHERE chain_id = $1`,
+    [chainId, chunk.toString()]
+  );
+}
+
 // ---------------------------------------------------------------------------
 // blocks: the timestamp cache and the reorg witness
 // ---------------------------------------------------------------------------
@@ -551,6 +617,83 @@ export async function getBlockHash(chainId: number, blockNumber: bigint): Promis
     [chainId, blockNumber.toString()]
   );
   return res.rows[0]?.block_hash ?? null;
+}
+
+/** `blocks` exactly as `pg` hands it back. */
+interface RawBlockRow {
+  block_number: string;
+  block_hash: string;
+  block_time: Date;
+}
+
+function toBlockRow(raw: RawBlockRow): BlockRow {
+  return {
+    blockNumber: toBigInt(raw.block_number),
+    blockHash: raw.block_hash,
+    blockTime: raw.block_time,
+  };
+}
+
+/**
+ * Every header we already hold in `[fromBlock, toBlock]`, keyed by
+ * `blockNumber.toString()`.
+ *
+ * ONE round trip for a whole range, rather than `getBlockHash` per block. The
+ * run loop needs this set twice over: to skip an `eth_getBlock` for a block it
+ * has already paid for (the "one getBlock per distinct block, ever" rule), and
+ * to supply `upsertMarkets`'s `times` map for a market whose creation block was
+ * stored by an earlier pass — which happens whenever the checkpoint is rewound
+ * by hand or by a reorg. Without the second use, re-indexing a range would throw
+ * `no block time for block N` on a block whose time is sitting in this table.
+ *
+ * The result is small even for a 4M-block range: `blocks` only ever holds
+ * event-bearing blocks.
+ */
+export async function knownBlockHeaders(
+  chainId: number,
+  fromBlock: bigint,
+  toBlock: bigint
+): Promise<Map<string, BlockRow>> {
+  const res = await getPool().query<RawBlockRow>(
+    `SELECT block_number, block_hash, block_time
+       FROM blocks
+      WHERE chain_id = $1 AND block_number >= $2 AND block_number <= $3`,
+    [chainId, fromBlock.toString(), toBlock.toString()]
+  );
+  const out = new Map<string, BlockRow>();
+  for (const row of res.rows) out.set(row.block_number, toBlockRow(row));
+  return out;
+}
+
+/**
+ * Stored blocks at or below `upperBlock`, HIGHEST FIRST, at most `limit` of them.
+ *
+ * The reorg walk-back's candidate list. Descending because the cut we want is the
+ * deepest block that still matches the chain, so the FIRST match walking down is
+ * the shallowest truncation that is correct — anything deeper would delete rows
+ * the chain still agrees with.
+ *
+ * `limit` is what bounds the walk: each candidate costs one `eth_getBlock`, and
+ * an unbounded walk on a chain whose stored history disagrees everywhere would
+ * spend thousands of requests before failing. Only event-bearing blocks are
+ * stored, so consecutive candidates are usually far apart in block number — the
+ * bound is a count of STORED BLOCKS EXAMINED, not a block distance.
+ */
+export async function blocksAtOrBelow(
+  chainId: number,
+  upperBlock: bigint,
+  limit: number
+): Promise<BlockRow[]> {
+  const rows = Number.isFinite(limit) ? Math.min(4096, Math.max(1, Math.floor(limit))) : 1;
+  const res = await getPool().query<RawBlockRow>(
+    `SELECT block_number, block_hash, block_time
+       FROM blocks
+      WHERE chain_id = $1 AND block_number <= $2
+      ORDER BY block_number DESC
+      LIMIT $3`,
+    [chainId, upperBlock.toString(), rows]
+  );
+  return res.rows.map(toBlockRow);
 }
 
 // ---------------------------------------------------------------------------
@@ -789,11 +932,29 @@ export async function questionIdByFpmm(chainId: number): Promise<Map<string, big
  *
  * After `truncateAbove`, the surviving row below the cut is what this returns,
  * so a reorg replay resumes from there rather than from genesis.
+ *
+ * `belowBlock` bounds the answer to history STRICTLY BELOW a block, and the run
+ * loop always passes the first block of the range it is about to replay. Without
+ * it the seed is the GLOBAL tail, which is wrong in one reachable case: a
+ * checkpoint rewound WITHOUT truncating (an operator resetting
+ * `last_indexed_block` by hand, and exactly what the e2e proof's resumability
+ * assertion does). The range would then be folded onto a state that already
+ * includes it — the already-stored rows survive on `ON CONFLICT DO NOTHING`, but
+ * any genuinely new event above them gets wrong reserves, and the next run seeds
+ * from THAT. Bounding the seed makes the fold correct for any checkpoint; in a
+ * normal forward-only run no row exists at or above the bound, so it changes
+ * nothing.
+ *
+ * Omitting the bound is expressed as a SENTINEL (`block_number` cannot reach the
+ * bigint column's own maximum) rather than as a nullable predicate, so the
+ * statement has one shape, one plan and no three-valued logic to reason about.
  */
 export async function latestReplayState(
   chainId: number,
-  questionId: bigint
+  questionId: bigint,
+  belowBlock?: bigint
 ): Promise<PoolState | null> {
+  const bound = typeof belowBlock === 'bigint' ? belowBlock : MAX_BIGINT;
   const res = await getPool().query<{
     reserve_yes: string;
     reserve_no: string;
@@ -801,10 +962,10 @@ export async function latestReplayState(
   }>(
     `SELECT reserve_yes, reserve_no, total_supply
        FROM market_events
-      WHERE chain_id = $1 AND question_id = $2
+      WHERE chain_id = $1 AND question_id = $2 AND block_number < $3
       ORDER BY block_number DESC, log_index DESC
       LIMIT 1`,
-    [chainId, questionId.toString()]
+    [chainId, questionId.toString(), bound.toString()]
   );
   const row = res.rows[0];
   if (!row) return null;
