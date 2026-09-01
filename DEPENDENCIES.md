@@ -119,6 +119,13 @@
   and `lib/format.ts` (`parseUsdc`), which are directly auditable and total (never throw).
   Removed rather than left installed, per the project's no-unnecessary-dependencies rule.
 
+  **Update (2026-09-01): `zod` is back in the lockfile — transitively, at `4.1.11`.** It arrives
+  as a dependency of `@vercel/functions` 3.9.5 (see that entry below). It is **not** a direct
+  dependency, appears in **no `package.json` of ours**, and is **never imported by our code** —
+  validation is still the dependency-free functions named above. So this is not a reversal of
+  the decision to stop using zod directly, but it is recorded here because this document must
+  not contain a statement that `package-lock.json` contradicts.
+
   ### Deliberately NOT added
 
   These were considered while building the UI and rejected in favour of ~50–150 lines of
@@ -205,9 +212,26 @@
   - **Why chosen:** provides `waitUntil()`, the only supported way to let a serverless response
     return while indexing work continues. Without it the choice is to hold a visitor's request
     open for the whole sweep or to have the runtime kill the work mid-write.
-  - **Why secure:** first-party Vercel package for the actual deploy target, so it is versioned
-    against the runtime rather than guessing at it. Tiny surface — the indexer uses it through
-    one seam, so the dependency is contained and mockable in tests. No advisories.
+  - **Why secure:** **the surface is not small, and an earlier version of this entry claimed it
+    was.** Installing it added **24 lockfile entries — itself plus 23 transitive packages**:
+    `@vercel/cli-config@0.2.4`, `@vercel/cli-exec@1.0.1`, `@vercel/oidc@3.8.5`,
+    `cross-spawn@7.0.6`, `execa@5.1.1`, `get-stream@6.0.1`, `human-signals@2.1.0`,
+    `jose@5.10.0`, `merge-stream@2.0.0`, `mimic-fn@2.1.0`, `npm-run-path@4.0.1`, `obuf@1.1.2`,
+    `onetime@5.1.2`, `os-paths@4.4.0`, `path-key@3.1.1`, `shebang-command@2.0.0`,
+    `shebang-regex@3.0.0`, `signal-exit@3.0.7`, `strip-final-newline@2.0.0`, `which@2.0.2`,
+    `xdg-app-paths@5.5.1`, `xdg-portable@7.3.0`, `zod@4.1.11`. Stated plainly: this puts a
+    **subprocess-spawning toolchain** (`execa` + `cross-spawn` + `shebang-command`/
+    `shebang-regex` + `which`) and a **full JWT/JOSE implementation** (`jose`) into production
+    `dependencies` — not devDependencies — for the sake of one function call. By contrast the
+    `pg` install added 21 entries, all of them recognizably the Postgres driver's own family.
+    The counterweight, and the reason it stays: it is **first-party Vercel for the actual
+    deploy target**, so it is versioned against the runtime rather than guessing at it;
+    `waitUntil()` has **no zero-dependency equivalent on this Next version** (`after()` from
+    `next/server` needs 15.1+, and `next` is pinned at 14.2.35); and the exposure is confined
+    to a **single module**, `lib/indexer/background.ts` (added in a later task), which imports
+    it and nothing else does — so the entire dependency can be removed by replacing one file.
+    `npm audit` reports no advisory against it or any of those 23 packages, and the repo's
+    advisory count is identical before and after the install.
   - **Better than alternatives:** a bare floating promise is exactly what `waitUntil` exists to
     replace — the sandbox may freeze immediately after the response, truncating the write. A
     long-lived worker (BullMQ, a container) means another service and another host to trust.
