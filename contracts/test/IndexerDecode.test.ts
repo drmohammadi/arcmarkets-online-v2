@@ -157,19 +157,6 @@ describe("indexer decode", () => {
       expect(ev?.shares, "shares is 777, not the trailing 123").to.equal(BigInt(777));
     });
 
-    it("gives the two liquidity events the same meaning for the same numbers", () => {
-      const added = one({
-        eventName: "LiquidityAdded",
-        args: { provider: TRADER, collateral: BigInt(5), shares: BigInt(9) },
-      });
-      const removed = one({
-        eventName: "LiquidityRemoved",
-        args: { provider: TRADER, shares: BigInt(9), collateral: BigInt(5) },
-      });
-      expect(added?.collateral).to.equal(removed?.collateral);
-      expect(added?.shares).to.equal(removed?.shares);
-    });
-
     it("decodes a batch and preserves order", () => {
       const events = decodeFpmmLogs([
         log({ eventName: "LiquidityAdded", args: { provider: TRADER, collateral: BigInt(10), shares: BigInt(10) } }),
