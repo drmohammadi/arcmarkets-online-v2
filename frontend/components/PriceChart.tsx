@@ -2,20 +2,37 @@
 
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { TradePoint } from '@/hooks/useTradeHistory';
+import { buildXScale } from '@/lib/chartScale';
 import { formatProbPct } from '@/lib/pricing';
+import { formatAbsoluteTime } from '@/lib/time';
 import { Skeleton } from './ui';
 
 /**
- * Price line: one small dot per trade, joined oldest-to-newest by a continuous
+ * Price line: one small dot per point, joined oldest-to-newest by a continuous
  * line. No candlesticks, no indicators, no drawing tools, no time-range tabs.
  *
- * The x-axis is trade SEQUENCE, not time, which is what lets the whole thing
- * avoid fetching a timestamp for every block (the old chart's single largest
- * source of RPC traffic). The last point is always the live contract price, so
- * the right-hand edge is correct even when no trade logs could be loaded at all.
+ * ── THE X-AXIS IS REAL TIME, WITH SEQUENCE SPACING AS THE FALLBACK ───────────
+ * Timestamps come from the INDEXER, which fetches one block header per
+ * event-bearing block ever and caches it forever. The browser still never calls
+ * `getBlock` for a chart point — that cost is what made a time axis impossible
+ * before, and it now belongs to the server, where it is paid once for all
+ * visitors.
+ *
+ * `TradePoint.t` is therefore optional, and `buildXScale` (`lib/chartScale.ts`)
+ * picks the axis from the data once per render: time-proportional when every
+ * point has a timestamp and the span is non-zero, even sequence spacing
+ * otherwise. Sequence spacing is the DEGENERATE CASE OF THIS RENDERER, not a
+ * second one — it is what the RPC fallback path in `useTradeHistory` draws, since
+ * that path has no timestamps and must not fetch any. Uneven spacing is the
+ * point of the change: a burst of trades then silence should look like a cluster
+ * then a flat run.
+ *
+ * The last point is always the live contract price, so the right-hand edge is
+ * correct even when no history could be loaded at all.
  *
  * Still hand-rolled SVG: a polyline and some circles do not justify a charting
- * library in the bundle.
+ * library in the bundle, and the tick labels are `Intl.DateTimeFormat` rather
+ * than a date library (see `DEPENDENCIES.md`).
  *
  * ── TWO RENDERING BUGS THIS FIXES ────────────────────────────────────────────
  * Reported as "the chart only shows a single large blue dot". Both causes were
@@ -61,6 +78,21 @@ const PAD_LEFT = 26;
 const PAD_RIGHT = 8;
 /** Vertical breathing room so a dot at 0% or 100% is not clipped in half. */
 const PAD_Y = 7;
+
+/**
+ * Height of the x-label row, in px, reserved UNCONDITIONALLY.
+ *
+ * The row exists even in sequence mode, where it holds no labels. Otherwise the
+ * card would change height depending on whether the data happened to carry
+ * timestamps — the plot would visibly jump when a load fell back to the RPC path,
+ * which reads as a layout bug rather than as a data source.
+ */
+const X_LABEL_H = 16;
+
+/** Labels on the axis, and the plot width below which four of them collide. */
+const X_TICKS = 4;
+const X_TICKS_NARROW = 3;
+const NARROW_W = 420;
 
 /**
  * Y-axis levels, top to bottom. These are the LABELS.
@@ -196,9 +228,23 @@ export function PriceChart({
    * dot to the right edge also matches where "now" belongs on every other chart
    * here, so a market's first trade extends the line leftward-to-rightward
    * naturally instead of making the dot jump.
+   *
+   * That right-edge parking is `buildXScale`'s `n < 2` case, not a branch here:
+   * one function decides every point's x so the two axis modes cannot drift apart.
+   * Everything downstream of `coords` — the path, the circles, the live marker,
+   * the flat dashed line — is unchanged and mode-agnostic.
    */
+  const scale = buildXScale(
+    points,
+    PAD_LEFT,
+    plotW,
+    // Fewer labels on a phone. Four "11:30 AM"-width labels collide below ~420px,
+    // and a collided axis is worse than a coarser one.
+    width < NARROW_W ? X_TICKS_NARROW : X_TICKS
+  );
+
   const coords = points.map((p, i) => ({
-    x: hasHistory ? PAD_LEFT + (i / (points.length - 1)) * plotW : PAD_LEFT + plotW,
+    x: scale.xAt(i),
     y: yForPct(Math.max(0, Math.min(10000, p.bps)) / 100),
     kind: p.kind,
     bps: p.bps,
@@ -333,6 +379,43 @@ export function PriceChart({
       </div>
 
       {/*
+        X labels: dates when the axis is time, nothing when it is sequence.
+
+        A SIBLING of the plot wrapper, not a child of it. The y labels above are
+        `absolute inset-y-0` against that wrapper, so anything added inside it
+        would stretch their spacing and pull every percentage off its gridline.
+
+        The row's height is reserved unconditionally — `X_LABEL_H` even with zero
+        labels — so falling back to the RPC path cannot make the card change
+        height. `aria-hidden` because the `sr-only` table below carries the same
+        timestamps in a form a screen reader can actually read.
+
+        Edge labels are anchored INWARD (first left-aligned, last right-aligned)
+        rather than centred on their tick, which would push them past the plot on
+        both sides.
+      */}
+      <div className="relative" style={{ height: X_LABEL_H }} aria-hidden="true">
+        {scale.ticks.length > 0 &&
+          scale.ticks.map((tick, i) => (
+            <span
+              key={i}
+              className="pointer-events-none absolute top-0 whitespace-nowrap text-2xs tabular-nums text-content-subtle"
+              style={{
+                left: tick.x,
+                transform:
+                  i === 0
+                    ? undefined
+                    : i === scale.ticks.length - 1
+                      ? 'translateX(-100%)'
+                      : 'translateX(-50%)',
+              }}
+            >
+              {tick.label}
+            </span>
+          ))}
+      </div>
+
+      {/*
         Says what the line actually is in each case. `degraded` is reported even
         when there IS history, because a truncated scan draws a real but partial
         line — presenting that as the full record would overstate it.
@@ -350,12 +433,18 @@ export function PriceChart({
             : 'Not traded yet — the price has held at its seeded level, shown flat. The line starts building on the first trade.'}
       </p>
 
-      {/* Accessible equivalent of the graphic. */}
+      {/*
+        Accessible equivalent of the graphic. It carries the timestamps the visual
+        axis shows, so the two renderings stay equivalent rather than one falling
+        behind the other. Points from the RPC fallback have no time and say so with
+        an em dash — the same fact the axis expresses by spacing evenly.
+      */}
       <table className="sr-only">
-        <caption>YES probability per trade, oldest to newest</caption>
+        <caption>YES probability over time, oldest to newest</caption>
         <thead>
           <tr>
             <th scope="col">#</th>
+            <th scope="col">Time</th>
             <th scope="col">Type</th>
             <th scope="col">YES probability</th>
           </tr>
@@ -364,6 +453,7 @@ export function PriceChart({
           {points.map((p, i) => (
             <tr key={i}>
               <td>{i + 1}</td>
+              <td>{(p.t === undefined ? '' : formatAbsoluteTime(p.t)) || '—'}</td>
               <td>{p.kind === 'now' ? 'Current price' : p.kind}</td>
               <td>{formatProbPct(p.bps)}</td>
             </tr>
