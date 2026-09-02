@@ -105,7 +105,11 @@ export default function MarketPage() {
   // at the right-hand edge even when no trade logs could be fetched.
   const yesBps = yesProbBps(market.reserveYes, market.reserveNo);
 
-  const history = useTradeHistory(market.fpmm, yesBps);
+  // The chart API is keyed by question id, so the hook needs it to read history
+  // from the indexer; without it the hook would only ever have its RPC fallback.
+  // This is the same id `useMarket` above was pointed at — including after an
+  // in-page outcome switch — so the history and the live price always agree.
+  const history = useTradeHistory(market.fpmm, yesBps, questionId ?? undefined);
 
   const group = useMemo(() => {
     if (questionId === null || visibleMarkets.length === 0) return null;
