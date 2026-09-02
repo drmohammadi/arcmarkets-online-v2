@@ -1009,7 +1009,94 @@ export async function truncateAbove(
   );
 }
 
-// `selectChartRows` (and its ChartQueryArgs/ChartRow types) belongs to Task 10,
-// which owns the bucket policy the query depends on. It is omitted rather than
-// stubbed: an exported function returning [] would typecheck at every call site
-// and silently produce an empty chart.
+// ---------------------------------------------------------------------------
+// The chart read
+// ---------------------------------------------------------------------------
+
+/**
+ * One chart request, already validated.
+ *
+ * `stepSec` and `limit` are INTEGERS produced by `lib/chart/buckets.ts`
+ * (`resolveInterval` / `clampLimit`), never strings from a query parameter, and
+ * both travel below as bound parameters. That is the whole reason the interval
+ * arrives as a resolved number rather than as a caller-chosen one: `interval`
+ * and `limit` are the two values a reader most expects to see interpolated into
+ * SQL, and CLAUDE.md names them explicitly.
+ */
+export interface ChartQueryArgs {
+  chainId: number;
+  questionId: bigint;
+  /** Inclusive window, unix seconds. */
+  fromSec: number;
+  toSec: number;
+  /** Bucket width in seconds. */
+  stepSec: number;
+  /** Hard cap on returned buckets. */
+  limit: number;
+}
+
+/** One chart point: bucket start in unix seconds, and the YES probability in bps. */
+export interface ChartRow {
+  t: number;
+  bps: number;
+}
+
+/**
+ * Downsampled price history for one market, ascending by bucket.
+ *
+ * THE LAST VALUE IN EACH BUCKET, NEVER THE AVERAGE. An average of a probability
+ * path is not a price: it smooths away exactly the extremes a trader is looking
+ * for, and two adjacent averaged buckets can both differ from every price that
+ * actually traded. `DISTINCT ON (bucket)` with `block_number DESC, log_index
+ * DESC` inside each bucket takes the last event the contract applied in it —
+ * ordered by log position, not by `block_time`, because several events share one
+ * block timestamp and only the log order is the order they happened in.
+ *
+ * WHEN THE LIMIT BINDS, THE NEWEST BUCKETS WIN. The inner `ORDER BY bucket DESC`
+ * is one word away from the obvious `ASC` and it is the difference between a
+ * useful chart and a broken one: empty buckets produce no rows at all, so the
+ * row count is the number of buckets that CONTAIN events, which `resolveInterval`
+ * cannot bound (it only knows the span). Ascending, `LIMIT` would keep the
+ * OLDEST populated buckets — a market with 400 trading days asked for at `1d`
+ * with `limit=200` would return days 1-200 and appear to have stopped six months
+ * ago, silently and plausibly. Descending, the same request returns the most
+ * recent 200 days. The outer `ORDER BY bucket` restores ascending order for the
+ * caller; `DISTINCT ON` is unaffected by the direction, since the pick within
+ * each bucket is decided by the columns after it.
+ *
+ * Raw rows are never deleted or rewritten to serve this: downsampling happens at
+ * READ time, so the full-resolution history stays recoverable and a different
+ * bucket width is a different query rather than a re-index.
+ *
+ * `bucket` is `::bigint` and therefore arrives as a string; it is a unix SECOND,
+ * not an amount or a block number, so `Number` is exact for it (2^53 seconds is
+ * 285 million years) and is what every consumer wants. `yes_bps` is an `integer`
+ * column with a `BETWEEN 0 AND 10000` check, so `pg` hands it back as a plain
+ * number that needs no conversion.
+ */
+export async function selectChartRows(args: ChartQueryArgs): Promise<ChartRow[]> {
+  // Defensive rather than trusting: a zero or negative step would be a division
+  // by zero in the bucket expression, and a non-integer limit is refused by
+  // Postgres outright. Both are impossible through `lib/chart/buckets.ts`; this
+  // costs nothing and means a future caller cannot make the query fail.
+  const step = Number.isSafeInteger(args.stepSec) && args.stepSec >= 1 ? args.stepSec : 60;
+  const rows = Number.isSafeInteger(args.limit) && args.limit >= 1 ? args.limit : 300;
+  const res = await getPool().query<{ bucket: string; yes_bps: number }>(
+    `SELECT bucket, yes_bps FROM (
+       SELECT DISTINCT ON (bucket)
+              (floor(extract(epoch FROM block_time) / $5::bigint) * $5::bigint)::bigint AS bucket,
+              yes_bps
+         FROM market_events
+        WHERE chain_id = $1
+          AND question_id = $2
+          AND block_time >= to_timestamp($3::double precision)
+          AND block_time <= to_timestamp($4::double precision)
+        ORDER BY bucket DESC, block_number DESC, log_index DESC
+        LIMIT $6
+     ) s
+      ORDER BY bucket`,
+    [args.chainId, args.questionId.toString(), args.fromSec, args.toSec, step, rows]
+  );
+  return res.rows.map((r) => ({ t: Number(r.bucket), bps: r.yes_bps }));
+}
+
