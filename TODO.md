@@ -2,7 +2,109 @@
 
 Progress snapshot. Read `CLAUDE.md` first for architecture and gotchas.
 
-## ✅ Latest session — chart, profile/leaderboard and outcome removal (2026-08-16)
+## ✅ Latest session — the chart indexer: Postgres index, chart API, time axis (2026-09-02)
+
+**The project now has a server side.** It lives inside `frontend/` — no separate service,
+no Docker, no VPS. See `docs/DEPLOYMENT-INDEXER.md` for the runbook and
+`docs/superpowers/specs/2026-08-31-chart-indexer-design.md` for the design.
+
+### What was built
+- [x] **Neon Postgres index** (`frontend/db/migrations/001_init.sql`): `indexer_state`
+      (checkpoint + lease), `blocks` (timestamp cache **and** reorg witness, only
+      event-bearing blocks), `markets`, `market_events` (raw args *and* replayed reserves
+      *and* derived prices, append-only, keyed `(chain_id, block_number, log_index)`).
+      **RPC stays the source of truth**; Postgres is a read-optimized projection of it.
+- [x] **The indexer** (`lib/indexer/**`): forward-only from one checkpoint, capped per run,
+      one transaction per range, serialized by a Postgres lease row, idempotent through
+      `ON CONFLICT DO NOTHING`. Reserves are replayed **exactly** from the four FPMM events
+      with **no RPC reads at all**; one `getBlock` per distinct event-bearing block, ever.
+- [x] **Three route handlers**: `/api/markets/[questionId]/chart` (history out of Postgres,
+      never blocks on indexing, degrades to a 200 with `degraded: true`),
+      `/api/indexer/tick` (cron entry, Bearer `CRON_SECRET`, constant-time compare over
+      SHA-256 digests), `/api/indexer/status` (unauthenticated health).
+- [x] **`useTradeHistory` reads the API** and no longer sweeps logs on the primary path.
+      Same return shape; `TradePoint` gains an optional `t` (unix seconds).
+      `NEXT_PUBLIC_CHART_SOURCE` selects `api` (default) / `rpc` / `auto`.
+- [x] **The x-axis is REAL TIME** (`lib/chartScale.ts`, zero imports so the contracts-side
+      mocha suite can reach it). Sequence spacing survives as the **degenerate case of the
+      same renderer** — it is what the RPC fallback draws, since that path has no
+      timestamps and must not fetch any. X tick labels use `Intl.DateTimeFormat`; the
+      `sr-only` table gained a Time column.
+- [x] **The RPC log sweep is kept permanently**, not as scaffolding. Neon's free tier
+      suspends on quota, so `auto` falls back to it on a non-OK response, a throw, or
+      `meta.degraded`. `lib/logScan.ts`, `lib/logCache.ts` and `lib/rpcQueue.ts` are
+      untouched.
+- [x] **Daily cron** (`frontend/vercel.json`, `17 3 * * *`). Per-minute would keep Neon's
+      compute awake continuously — ~180 CU-hours/month against a 100 CU-hour allowance —
+      and suspend the database for the rest of the billing month. Traffic is the primary
+      trigger; cron is the floor. Indexer lag never blocks the current price, which is why
+      daily is enough.
+
+### Verification (this session)
+- [x] `npm test` → **203 passing / 24 pending** (was 197/24; +6 `ChartScale` assertions,
+      zero regressions)
+- [x] `cd frontend && npx tsc --noEmit` → **0 errors**
+- [x] `npm run build` → **success, 14 routes**
+- [x] `npx hardhat run scripts/e2e-indexer.ts` (earlier task in this change) — deploys
+      locally, emits every indexed event including a price-moving second `addLiquidity`
+      onto an unbalanced pool, indexes it, and asserts the **replayed reserves equal
+      on-chain `reserves()` exactly**. That is the decisive test; re-run it after any
+      change to the indexer or the replay arithmetic.
+
+### Dependencies added (both recorded in `DEPENDENCIES.md`)
+- [x] **`pg` 8.23.0** (published 2026-08-08) — parameterized SQL, no native addon, works
+      identically against a local Postgres and a Neon branch, which is what makes the e2e
+      proof possible without a testnet.
+- [x] **`@vercel/functions` 3.9.5** (published 2026-08-20) — `waitUntil()`, the only
+      supported way to let a response return while indexing continues. `after()` needs Next
+      15.1+ and we are pinned to 14.2.35. Confined to `lib/indexer/background.ts`, so the
+      whole dependency can be removed by replacing one file. It costs 23 transitive
+      packages, itemised in `DEPENDENCIES.md`.
+- [x] **The "no database / no indexer" rows in `DEPENDENCIES.md` are explicitly reversed**,
+      not silently contradicted. The old rejection's reasoning was sound; its premise was
+      wrong — "~6 requests per sweep" is true of the request *count* and false of the
+      *outcome*, because 40 requests per load cannot finish a 1.7M-block window.
+
+### Open follow-ups
+- [ ] **Chunk the `eth_getLogs` address array** before the market count reaches the low
+      hundreds. A provider refusal for *too many addresses* currently fails the run instead
+      of subdividing — the adaptive halving only narrows the block range.
+- [ ] **Add a `checksum` column to `market_events`** so replay drift outlives one tick.
+      Today the signal lands in `last_error`, which the next successful commit clears, so
+      `degraded` is transient and a cleared error is not evidence the drift was resolved.
+      Procedure for catching it meanwhile: `docs/DEPLOYMENT-INDEXER.md` §9.5.
+- [ ] **Fix the bare `msg.includes('429')` at `frontend/lib/rpcQueue.ts:87`.** The
+      indexer's copy of that check is fixed; the browser's is not, so a block number
+      containing "429" is misread as a rate limit. Left alone deliberately this session —
+      `rpcQueue.ts` was out of scope.
+- [ ] **Strengthen `scripts/e2e-indexer.ts`**: assert every row's reserves at *its own*
+      block via `blockTag` (not just the final state), assert `MarketCreated`'s non-key
+      columns against the factory's `markets()` getter, and make the header-dedup assertion
+      real by putting two events in one block.
+- [ ] **`accepted_chunk` is still unmeasured against Arc.** The 250,000 default is inferred
+      from the frontend constants and the documented 1,048,576 refusal. The first real
+      backfill measures it; read it back and pin `INDEXER_CHUNK_BLOCKS` (runbook §5).
+- [ ] **`waitUntil()` is unproven until a real deploy.** There is no Vercel runtime on a dev
+      machine; locally `background.ts` awaits instead. First proof is the deploy, watched
+      through `/api/indexer/status`.
+- [ ] **`/profile` and `/leaderboard` still use the browser log sweep.** They have the same
+      1.7M-block problem and the same fix applies, but bundling them would have made this
+      change unreviewable.
+- [ ] **No frontend test runner exists**, so the chart's pure logic (`lib/chartScale.ts`,
+      `lib/chart/buckets.ts`, `lib/indexer/replay.ts`) is tested from the **contracts**
+      workspace by relative import. That is why those modules have zero imports. Adding a
+      runner is a dependency decision for the project owner.
+- [ ] **Periodic reconciliation is not built.** Comparing replayed reserves against a live
+      `reserves()` call on the cron path would catch drift the checksum cannot see (a stray
+      ERC-1155 transfer into a pool). Asserted once locally in the e2e; deliberately
+      deferred until real Arc data exists to reconcile against.
+- [ ] **No browser verification this session.** Verified by typecheck, build and the test
+      suite only, per the owner's request to cut long checks. Worth clicking: a market with
+      several trades in `api` mode (date labels, uneven spacing, a right-edge live dot),
+      then `rpc` mode (even spacing, no labels), then a phone width (labels must not
+      collide).
+
+## ✅ Previous session — chart, profile/leaderboard and outcome removal (2026-08-16)
 
 Three reported bugs. **Two of them were the same bug**, which is the useful finding.
 
@@ -518,10 +620,14 @@ Three reported bugs. **Two of them were the same bug**, which is the useful find
   three contracts. The current grouping approach deliberately avoids that.
 - **Market images and the hidden list are per-browser `localStorage`.** They are NOT
   shared between users and NOT on-chain — the contracts have no image field and no
-  delete/archive function, and there is no backend. Another visitor sees the generated
-  monogram icon and the full market list. Making either shared needs a contract change
-  plus a host; deliberately not done to avoid a redeploy that would abandon the markets
-  currently live at the testnet factory address.
+  delete/archive function. Another visitor sees the generated monogram icon and the full
+  market list. **A backend now exists** (Neon Postgres behind the route handlers in
+  `frontend/app/api/**`), which closes out the older "there is no backend" caveat — but
+  neither images nor the hidden list moved into it, deliberately: that database is a
+  projection of chain bytes, and putting per-browser UI state in it would make it a system
+  of record. Shared images are already solved on-chain by `MarketMetadata.sol` (external
+  https URLs); the `localStorage` read path survives only so pre-existing uploads do not
+  vanish.
 - **Multi-outcome creation is N transactions, not one.** Each outcome is its own binary
   market, so a 4-outcome event needs 4 signatures. An interrupted run leaves the
   already-created outcomes on-chain; the UI reports how many succeeded.

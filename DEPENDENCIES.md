@@ -255,3 +255,50 @@
   reuse the existing dependency-free validators), and no separate cron service (Vercel Cron is
   configuration, not a package). The `db:migrate` script runs through `npx tsx`, which is
   fetched on demand rather than installed, so it adds nothing to the dependency tree.
+
+  ### Reversal: the "no database / no indexer" entry above is now superseded
+
+  Two rows in **Deliberately NOT added** argued against exactly what this change
+  builds: `a database / ORM (prisma, drizzle) + a blob host`, and
+  `a subgraph / indexer (The Graph, Ponder)`. They are reversed here explicitly
+  rather than left to be quietly contradicted by the code, because one half of each
+  rejection is still correct and the half that was wrong is worth stating precisely.
+
+  **What was wrong: the premise, not the reasoning.** The indexer row rejected an
+  external service on the grounds that `getLogs` was cheap enough not to need one —
+  "one bounded sweep covers every market and both event types in ~6 requests
+  regardless of market count". That is **true of the request COUNT and false of the
+  OUTCOME.** Six requests is what one sweep costs; it is not what covering the
+  history costs. The sweep is bounded by a **40-request-per-load budget across a
+  1.7M-block window** — Arc testnet's head is that far past the factory's deploy
+  block — and a rate-limited public node halves the usable width whenever it
+  refuses a range. So the sweep is a *growing window* over the history rather than
+  the whole of it: it never reports `complete` on a cold load, which is exactly why
+  `lib/logCache.ts` has to exist at all, carrying partial depth between visits. The
+  arithmetic in that row was sound. Its premise — that request count and coverage
+  are the same measurement — was not.
+
+  **What is still true, and now irrelevant: "Vercel serverless has no persistent
+  disk."** Both rejected rows leaned on it, and it remains a fact — `/tmp` is
+  ephemeral, which is why the `node:sqlite` row above is still correctly rejected
+  for that exact reason. It is irrelevant *here* because the persistence is
+  **Neon's, not the function's**: the deploy target holds a connection, not a
+  database. An argument against a database *on the deploy target* was never an
+  argument against a managed Postgres reached over the network, and reading it as
+  one is what delayed this change.
+
+  **What is NOT reversed.** No ORM and no query builder: `prisma`/`drizzle` were
+  rejected for adding a schema language, a generate step and a large install for a
+  schema this small, and that still holds — `db/migrations/001_init.sql` is plain
+  SQL and every statement is parameterized text in `lib/db/queries.ts`. No external
+  indexing service either: The Graph and Ponder remain services to run and trust,
+  while the indexer here is code in this repo (`lib/indexer/**`) reaching the
+  database through the one dependency justified above. The on-chain registries
+  (`MarketMetadata.sol`, `Social.sol`) stay exactly where they are — nothing about
+  descriptions, images, usernames or comments moves into Postgres. `market_events`
+  is a projection of chain bytes, not a system of record.
+
+  **The package entries for this change are above** — `pg` 8.23.0,
+  `@vercel/functions` 3.9.5 and `@types/pg` 8.11.10, each in the four-point format
+  and each verified against the registry. This section adds no package; it records
+  a decision being overturned.
