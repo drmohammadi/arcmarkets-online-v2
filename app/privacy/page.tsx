@@ -15,7 +15,7 @@ export default function PrivacyPage() {
         <p>
           This interface has no backend server, no database and no user accounts. We do not ask for
           your name, email address or any other personal detail, and there is nowhere for us to
-          store one. We do not run analytics or advertising trackers, and we do not sell data —
+          store one. We do not run analytics or advertising trackers, and we do not sell data 
           there is no data to sell.
         </p>
         <p>
@@ -29,7 +29,7 @@ export default function PrivacyPage() {
           Trades, approvals, liquidity, redemptions and your wallet address are recorded on a public
           blockchain. Anyone can read them, they are permanent, and they cannot be edited or deleted
           by us or by you. Your address is pseudonymous rather than anonymous: if it is ever linked
-          to your identity — for example through an exchange withdrawal — its entire history can be
+          to your identity for example through an exchange withdrawal its entire history can be
           linked to you as well.
         </p>
       </Section>
@@ -59,7 +59,7 @@ export default function PrivacyPage() {
         <Bullets
           items={[
             'A blockchain RPC provider, to read market data and submit your transactions.',
-            'Your wallet provider, and — for mobile wallets — the WalletConnect relay used to establish the connection.',
+            'Your wallet provider, and for mobile wallets the WalletConnect relay used to establish the connection.',
             'Whatever image hosts market creators have linked to, when a market image loads.',
             'The hosting provider serving this site.',
           ]}
@@ -68,7 +68,7 @@ export default function PrivacyPage() {
           Market images are the one to be aware of. They are external URLs chosen by whoever created
           the market, so loading a market page tells that third-party host your IP address. We send
           a no-referrer instruction with each image request, so the host is not told which page or
-          market you were viewing — but it can still see that a visitor loaded the image. We cannot
+          market you were viewing but it can still see that a visitor loaded the image. We cannot
           prevent that without hosting the images ourselves.
         </p>
       </Section>
@@ -83,7 +83,7 @@ export default function PrivacyPage() {
       <Section heading="Your choices">
         <Bullets
           items={[
-            'Browse without connecting a wallet — markets, prices and charts are all readable without one.',
+            'Browse without connecting a wallet markets, prices and charts are all readable without one.',
             'Disconnect your wallet at any time from your wallet application.',
             'Clear this site’s browser storage to erase every local preference described above.',
             'Use a separate wallet address if you do not want activity linked to your main one.',
@@ -95,7 +95,7 @@ export default function PrivacyPage() {
         <p>
           Because there is no account system, there is no profile to access, correct or export. And
           because blockchain records are immutable and not under our control, we cannot delete,
-          amend or anonymize your on-chain history — not on request, and not by court order. Please
+          amend or anonymize your on-chain history not on request, and not by court order. Please
           take that into account before transacting.
         </p>
       </Section>
