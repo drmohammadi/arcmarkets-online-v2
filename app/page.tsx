@@ -89,7 +89,7 @@ export default function HomePage() {
           <p className="mt-1 text-sm text-content-muted">
             {isConnected
               ? 'Trade YES or NO on any outcome. Settled in USDC on Arc.'
-              : 'Browse freely — connect a wallet to trade. Settled in USDC on Arc.'}
+              : 'Browse freely , connect a wallet to trade. Settled in USDC on Arc.'}
           </p>
         </div>
 
