@@ -169,7 +169,6 @@ function internalOrExternal(
 export const SOCIAL_LINKS: SiteLink[] = [
   external('Twitter / X', process.env.NEXT_PUBLIC_LINK_TWITTER, 'https://x.com/circle'),
   external('Discord', process.env.NEXT_PUBLIC_LINK_DISCORD, 'https://discord.com/invite/buildoncircle'),
-  external('Github', process.env.NEXT_PUBLIC_LINK_GITHUB, 'https://github.com/drmohammadi'),
 ];
 
 /**
