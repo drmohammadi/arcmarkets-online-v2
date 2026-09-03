@@ -55,10 +55,10 @@ export function Footer() {
 
         <div className="mt-10 flex flex-col gap-3 border-t border-edge pt-6 text-2xs text-content-subtle sm:flex-row sm:items-center sm:justify-between">
           <p>
-            &copy; {year} {SITE.name}. Not investment advice.
+            &copy; {year} {SITE.name}. Built by Fabio on Arc.
           </p>
           <p>
-            Testnet build — markets settle in test USDC and carry no monetary value.
+            Testnet build markets settle in test USDC and carry no monetary value.
           </p>
         </div>
       </div>
