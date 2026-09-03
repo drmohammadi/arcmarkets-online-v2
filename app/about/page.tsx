@@ -13,7 +13,7 @@ export default function AboutPage() {
       <Section heading="What this is">
         <p>
           {SITE.name} lets you trade on the outcome of real-world events. Each market asks a
-          question with two possible answers YES or NO and you buy shares in the outcome you
+          question with two possible answers — YES or NO — and you buy shares in the outcome you
           expect. If you are right, each share you hold pays out 1 USDC when the market resolves. If
           you are wrong, it pays nothing.
         </p>
@@ -32,7 +32,7 @@ export default function AboutPage() {
         </p>
         <p>
           This means you can always trade, at any size, without waiting for someone to take the
-          other side but large trades move the price against you. The estimate shown before you
+          other side — but large trades move the price against you. The estimate shown before you
           confirm already accounts for that.
         </p>
       </Section>
@@ -48,14 +48,14 @@ export default function AboutPage() {
 
       <Section heading="Resolution">
         <p>
-          Every market has a resolution date and a named resolver the address permitted to report
+          Every market has a resolution date and a named resolver — the address permitted to report
           the result. A market cannot be resolved before its resolution date, cannot be resolved
           twice, and cannot be resolved by anyone else. Many markets also list a resolution source,
           which is the reference used to determine the answer.
         </p>
         <p>
           Once resolved, holders of the winning outcome can redeem each share for 1 USDC. Losing
-          shares become worthless. You do not have to wait for resolution to exit you can sell at
+          shares become worthless. You do not have to wait for resolution to exit — you can sell at
           the current market price at any time before then.
         </p>
       </Section>
@@ -78,7 +78,7 @@ export default function AboutPage() {
       <Section heading="This is testnet software">
         <p>
           This deployment runs on Arc testnet. The USDC is a test token with no monetary value, the
-          markets are for demonstration, and the network may be reset without notice which would
+          markets are for demonstration, and the network may be reset without notice — which would
           clear all markets and balances. Do not treat positions here as an investment.
         </p>
       </Section>

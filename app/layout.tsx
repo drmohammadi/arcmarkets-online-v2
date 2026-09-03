@@ -4,8 +4,8 @@ import { Providers } from '@/lib/wagmi';
 import { Footer } from '@/components/Footer';
 
 export const metadata: Metadata = {
-  title: '0xOutCome Prediction Markets on Arc',
-  description: 'Trade binary prediction markets settled in USDC on Circle Arc L1. Built by Fabio on Arc',
+  title: 'Arc Markets — Prediction Markets on Arc',
+  description: 'Trade binary prediction markets settled in USDC on Circle Arc L1.',
 };
 
 /**

@@ -1,0 +1,29 @@
+node_modules/
+.next/
+out/
+.env
+.env.local
+.env.*.local
+
+*.log
+
+tsconfig.tsbuildinfo
+
+.vercel/
+
+# Build / cache
+coverage/
+dist/
+
+# Local database / temporary files
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

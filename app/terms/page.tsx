@@ -79,7 +79,7 @@ export default function TermsPage() {
       <Section heading="7. Resolution is performed by the resolver">
         <p>
           Each market names a resolver — the only address that may report that market&apos;s outcome
-           and a resolution date before which it cannot be resolved. Resolution happens once and
+          — and a resolution date before which it cannot be resolved. Resolution happens once and
           cannot be undone. We do not adjudicate disputes about a resolution and have no ability to
           reverse one after it is recorded on-chain.
         </p>

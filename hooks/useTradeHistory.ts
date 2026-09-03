@@ -1,25 +1,51 @@
 'use client';
 
 /**
- * Simple trade-price history for one pool.
+ * Price history for one market: the indexer API first, the RPC log sweep as the
+ * permanent fallback.
  *
- * ── PRICE COMES FROM THE EVENT, NOT FROM REPLAYED RESERVES ───────────────────
- * A trade event already carries its own execution price in its arguments:
+ * ── HISTORY COMES FROM THE INDEXER, NOT FROM THE BROWSER ─────────────────────
+ * `GET /api/markets/[questionId]/chart` serves the line out of Neon Postgres.
+ * The server has already paid all three of the expensive costs, once, for every
+ * visitor rather than once per visitor:
  *
- *   Buy(outcome, investmentAmount, sharesOut) -> paid investmentAmount for
- *   sharesOut shares, so price per share = investmentAmount / sharesOut.
+ *   1. the `eth_getLogs` sweep forward from the factory's deploy block;
+ *   2. ONE `getBlock` per event-bearing block, EVER, cached in `blocks` forever —
+ *      which is what makes a real time x-axis affordable. **The browser must
+ *      never call `getBlock` for a chart point**; per-block header fetches from
+ *      here are what made a time axis impossible before;
+ *   3. the reserve replay — reconstructing pool reserves exactly from the four
+ *      FPMM events and storing the marginal price per event.
  *
- *   Sell(outcome, returnAmount, sharesIn)     -> received returnAmount for
- *   sharesIn shares, so price per share = returnAmount / sharesIn.
+ * (3) MUST NOT COME BACK HERE. A browser-side replay was correct but so
+ * RPC-hungry it caused the 429s it then reported; server-side it is nearly free.
+ * The replay is not forbidden, only its location is.
  *
- * Since a share pays exactly 1 USDC if it wins, that ratio IS the implied
- * probability. One event, one point — no reserve state to reconstruct, nothing to
- * verify against the live pool, and no `getBlock` per block for timestamps (the
- * x-axis is trade SEQUENCE, which is why there are no time-range tabs).
+ * So `bps` from the API is the MARGINAL implied probability
+ * `reserveNo / (reserveYes + reserveNo)`, the same quantity as the live `'now'`
+ * point. One quantity end to end: the chart used to mix fee-inclusive execution
+ * prices for history with a marginal price for the live point, which put a fake
+ * jump of up to ±fee at the right-hand edge.
  *
- * That part was right and is unchanged. Do NOT reintroduce a reserve replay.
+ * ── THE SWEEP BELOW IS THE PERMANENT FALLBACK, NOT DEAD CODE ─────────────────
+ * `loadTrades`, `priceBps`, `EV_BUY`/`EV_SELL` and `lib/logScan.ts` stay for
+ * good. Neon's free tier suspends on quota and the daily cron lets it sleep, so a
+ * chart that degrades to slow-but-working beats one that shows nothing.
+ * `NEXT_PUBLIC_CHART_SOURCE` picks the path: `api` (default), `rpc`, or `auto`
+ * (the API, then the sweep if it fails).
  *
- * ── WHAT WAS BROKEN ──────────────────────────────────────────────────────────
+ * Two things the fallback cannot do, both accepted rather than worked around:
+ *
+ *  - It prices each trade from the event's OWN arguments, which is a
+ *    fee-INCLUSIVE execution price rather than the marginal one. The
+ *    alternative is a browser replay, which is exactly what is forbidden above.
+ *  - It has NO TIMESTAMPS. `CachedEvent` stores `blockNumber` and `logIndex`
+ *    only, and filling that in means the header fetches this hook exists to
+ *    stop. That is why `TradePoint.t` is OPTIONAL and why `PriceChart` keeps
+ *    even sequence spacing as the degenerate case of one renderer
+ *    (`lib/chartScale.ts`), not as a second renderer.
+ *
+ * ── WHY THE SWEEP CAN ONLY EVER BE THE FALLBACK ──────────────────────────────
  * Two rounds of the same mistake: the scan had no idea WHERE the market was.
  *
  * First it was a fixed 54,000-block window below the head — anchored to the head
@@ -46,11 +72,19 @@
  * because viem accepts an events ARRAY and turns it into a topic0 OR-set. That
  * halves the request count outright.
  *
+ * What none of that fixes is the ARITHMETIC OF THE BUDGET, and that is why the
+ * sweep is now second choice rather than the primary path: it is capped at 40
+ * requests per load against a 1.7M-block window on a rate-limited public node, so
+ * it is a GROWING window over the history rather than the whole of it. It never
+ * reports `complete` on a cold load, which is also why `logCache` has to exist.
+ *
  * ── NEVER FAILS VISIBLY ──────────────────────────────────────────────────────
- * This hook does not surface errors. If the log query is rate-limited or fails
- * for any reason, it returns whatever it has (often nothing) and sets `degraded`.
- * The chart then draws the live contract price alone. A chart showing one true
- * point beats an error message, and the current price never depended on logs.
+ * This hook does not surface errors. If the API is unreachable, or the log query
+ * is rate-limited, or anything else fails, it returns whatever it has (often
+ * nothing) and sets `degraded`. The chart then draws the live contract price
+ * alone — labelled, not hidden. A chart showing one true point beats an error
+ * message, and the current price comes from the contract, so it never depended on
+ * either history path.
  */
 
 import { useCallback, useMemo } from 'react';
@@ -111,20 +145,51 @@ const ENOUGH_EVENTS = 250;
 /** Points beyond this are dropped from the head; a line needs shape, not density. */
 const MAX_POINTS = 200;
 
+/**
+ * Which history path runs, fixed at build time.
+ *
+ * A LITERAL `process.env.NEXT_PUBLIC_CHART_SOURCE` access, never a computed one
+ * (`process.env[name]`, destructuring, a helper taking the name as an argument).
+ * Next inlines only static property accesses; anything else reaches the browser
+ * as `undefined` and this would silently pin itself to the default forever.
+ * `lib/links.ts:15` documents the same trap.
+ *
+ * It is the only new public variable in this change and it carries no secret —
+ * `DATABASE_URL`, `INDEXER_RPC_URL` and `CRON_SECRET` are server-only and must
+ * never acquire a `NEXT_PUBLIC_` name.
+ */
+const CHART_SOURCE: 'api' | 'rpc' | 'auto' =
+  process.env.NEXT_PUBLIC_CHART_SOURCE === 'rpc'
+    ? 'rpc'
+    : process.env.NEXT_PUBLIC_CHART_SOURCE === 'auto'
+      ? 'auto'
+      : 'api';
+
 export interface TradePoint {
   /** Implied YES probability in basis points (0..10000). */
   bps: number;
   kind: 'buy' | 'sell' | 'now';
+  /**
+   * Unix SECONDS, when the point's time is known.
+   *
+   * Present on every point the indexer API serves and on the live `'now'` point.
+   * ABSENT on the RPC fallback path, which has no timestamps and must not fetch
+   * any (see the header). That is why it is optional rather than required:
+   * `buildXScale` selects a time axis only when EVERY point has one, and even
+   * sequence spacing otherwise.
+   */
+  t?: number;
 }
 
 export interface TradeHistory {
   points: TradePoint[];
   isLoading: boolean;
-  /** True when trades could not be loaded, so only the live price is shown. */
+  /** True when history could not be loaded, so only the live price is shown. */
   degraded: boolean;
   /**
-   * True when history is known to reach back to the start of the chain, so the
-   * line is the market's complete record rather than a recent slice.
+   * True when history is known to be the market's complete record rather than a
+   * recent slice: `meta.complete` (the chain's backfill is whole) on the API
+   * path, and "the sweep reached the factory's deploy block" on the fallback.
    */
   complete: boolean;
   /**
@@ -162,7 +227,7 @@ function priceBps(name: string, args: Record<string, string>): number | null {
   }
 }
 
-/** What one load resolves to: the events, plus how far the scan actually got. */
+/** What one SWEEP resolves to: the events, plus how far the scan actually got. */
 interface TradeData {
   events: CachedEvent[];
   /**
@@ -177,9 +242,135 @@ interface TradeData {
   reachedFloor: boolean;
 }
 
+/**
+ * What one LOAD resolves to, from either source.
+ *
+ * Both paths converge here so the hook body has no idea which one ran, and the
+ * two flags keep exactly the meanings `TradeData` gave them: `incomplete` is a
+ * failure, `reachedFloor` is "this is the whole record". On the API path they map
+ * to a failed fetch and `meta.complete` respectively.
+ */
+interface HistoryData {
+  /** History oldest-first, WITHOUT the live point, which the hook appends. */
+  points: TradePoint[];
+  incomplete: boolean;
+  reachedFloor: boolean;
+}
+
+/** Nothing loaded, nothing wrong: the shape for a disabled query. */
+const EMPTY_HISTORY: HistoryData = { points: [], incomplete: false, reachedFloor: false };
+
+/** Nothing loaded, and that IS wrong: only the live point will be drawn. */
+const FAILED_HISTORY: HistoryData = { points: [], incomplete: true, reachedFloor: false };
+
+/** One point as the chart API serves it. Everything else in the body is ignored. */
+interface ApiPoint {
+  t: unknown;
+  bps: unknown;
+}
+
+/**
+ * Fetch history from the indexer, or null when the API did not serve any.
+ *
+ * NULL IS "ASK THE FALLBACK", not "no trades". An untraded market returns an
+ * empty `points` array with `incomplete: false`, which is a successful answer and
+ * draws the flat dashed line. Null is returned for a non-OK status, a throw, a
+ * body that is not the documented shape, and for `meta.degraded` — that last one
+ * arrives as a 200 because the route degrades rather than erroring (its header
+ * explains why), and treating it as success would leave `auto` unable to fall
+ * back in the one case it exists for: an unreachable database.
+ *
+ * Total: never throws. Every failure is a null.
+ */
+async function loadFromApi(questionId: bigint): Promise<HistoryData | null> {
+  try {
+    /*
+     * `from=all` because a price chart's whole point is the record, not a recent
+     * slice — CLAUDE.md's twice-bitten rule about head-relative windows applies
+     * to a time window exactly as it does to a block window. `interval=auto`
+     * lets the server widen buckets to fit, and `limit=200` matches MAX_POINTS,
+     * so nothing is fetched that no pixel can show.
+     *
+     * No `outcome` parameter: the series is always the YES probability, matching
+     * `currentBps`, and 0 is the route's default. No client-side timeout either
+     * — the route deliberately budgets ~20s for a Neon wake-up and Vercel caps it
+     * at 30s, so aborting sooner would abandon a wake-up that was about to
+     * succeed and degrade every first visitor after a suspension.
+     */
+    const res = await fetch(
+      `/api/markets/${questionId.toString()}/chart?from=all&interval=auto&limit=${MAX_POINTS}`,
+      { headers: { accept: 'application/json' } }
+    );
+    if (!res.ok) return null;
+
+    const body: unknown = await res.json();
+    if (!body || typeof body !== 'object') return null;
+    const raw = (body as { points?: unknown }).points;
+    if (!Array.isArray(raw)) return null;
+
+    const meta = (body as { meta?: { complete?: unknown; degraded?: unknown } }).meta;
+    if (meta?.degraded === true) return null;
+
+    const points: TradePoint[] = [];
+    for (const item of raw as ApiPoint[]) {
+      const t = typeof item?.t === 'number' ? item.t : Number.NaN;
+      const bps = typeof item?.bps === 'number' ? item.bps : Number.NaN;
+      // A malformed point is dropped, never plotted at 0% or at the epoch. The
+      // route clamps both server-side; this is the boundary check that makes the
+      // clamp an assertion rather than a hope.
+      if (!Number.isFinite(t) || t <= 0 || !Number.isFinite(bps) || bps < 0 || bps > 10000) {
+        continue;
+      }
+      /*
+       * `kind: 'buy'` for every API point, deliberately. The response carries no
+       * direction — one row per event is what makes a binary market one series —
+       * and the chart uses `kind` only to label the live point and to fill the
+       * `sr-only` table's Type column. The visible marker is identical either
+       * way. DO NOT "fix" this by adding a direction column to the query: the
+       * chart has nothing to draw with it. (The honest fix, if the table's
+       * wording ever matters, is a neutral kind — not more SQL.)
+       */
+      points.push({ bps: Math.round(bps), kind: 'buy', t: Math.floor(t) });
+    }
+
+    return { points, incomplete: false, reachedFloor: meta?.complete === true };
+  } catch {
+    // Offline, aborted, a proxy returning HTML, a JSON parse failure: all the
+    // same answer. The caller decides whether that means the sweep or a degraded
+    // chart, and it is never an exception a render path has to catch.
+    return null;
+  }
+}
+
+/**
+ * The sweep's events as plottable points.
+ *
+ * No `t`: `CachedEvent` has no timestamp and getting one means a `getBlock` per
+ * block from the browser, which is the cost this whole change removes. The
+ * absence is what selects sequence spacing in `buildXScale`.
+ */
+function pointsFromEvents(data: TradeData): HistoryData {
+  const points: TradePoint[] = [];
+  for (const ev of data.events) {
+    const bps = priceBps(ev.name, ev.args);
+    if (bps === null) continue;
+    points.push({ bps, kind: ev.name === 'Buy' ? 'buy' : 'sell' });
+  }
+  return { points, incomplete: data.incomplete, reachedFloor: data.reachedFloor };
+}
+
 export function useTradeHistory(
   fpmm: `0x${string}` | undefined,
-  currentBps: number
+  currentBps: number,
+  /**
+   * The market's question id, which the API is keyed by.
+   *
+   * Optional so the hook still works without it — `api` degrades to the live
+   * point and `auto` goes straight to the sweep, both of which are honest
+   * answers rather than a crash. `app/market/[id]/page.tsx` passes it; that one
+   * call-site edit is the only change outside this file.
+   */
+  questionId?: bigint
 ): TradeHistory {
   const client = usePublicClient();
   const chainId = useChainId();
@@ -187,11 +378,11 @@ export function useTradeHistory(
   const enabled = !!client && !!fpmm;
 
   const queryKey = useMemo(
-    () => ['tradeHistory', chainId, fpmm ?? null] as const,
-    [chainId, fpmm]
+    () => ['tradeHistory', chainId, fpmm ?? null, questionId?.toString() ?? null] as const,
+    [chainId, fpmm, questionId]
   );
 
-  const { data, isLoading, isError } = useQuery<TradeData, Error>({
+  const { data, isLoading, isError } = useQuery<HistoryData, Error>({
     queryKey,
     enabled,
     staleTime: 5 * 60_000,
@@ -199,31 +390,53 @@ export function useTradeHistory(
     refetchInterval: false,
     refetchOnWindowFocus: false,
     refetchOnMount: false,
-    // rpcQueue already backs off on 429; a retry on top would multiply requests
-    // at exactly the moment the RPC is asking us to slow down.
+    // No retry on either path. On the sweep, `rpcQueue` already backs off on 429
+    // and a retry on top would multiply requests at exactly the moment the RPC is
+    // asking us to slow down. On the API path a failure is already handled — the
+    // fallback or a degraded label — so a retry would only delay it.
     retry: false,
     queryFn: async () => {
-      if (!client || !fpmm) return { events: [], incomplete: false, reachedFloor: false };
-      return loadTrades(client, chainId, fpmm);
+      if (!client || !fpmm) return EMPTY_HISTORY;
+
+      /*
+       * `api` and `auto` both try the indexer first. Without a `questionId`
+       * there is nothing to ask it for, so that case skips straight to the
+       * decision below rather than fetching a URL with `undefined` in it.
+       */
+      if (CHART_SOURCE !== 'rpc') {
+        const fromApi = questionId === undefined ? null : await loadFromApi(questionId);
+        if (fromApi !== null) return fromApi;
+        // `api` is fetch-only by definition: degrade to the live point rather
+        // than quietly spending the 40-request sweep this mode exists to avoid.
+        if (CHART_SOURCE === 'api') return FAILED_HISTORY;
+      }
+
+      return pointsFromEvents(await loadTrades(client, chainId, fpmm));
     },
   });
 
   const points = useMemo(() => {
-    const out: TradePoint[] = [];
-
-    for (const ev of data?.events ?? []) {
-      const bps = priceBps(ev.name, ev.args);
-      if (bps === null) continue;
-      out.push({ bps, kind: ev.name === 'Buy' ? 'buy' : 'sell' });
-    }
+    const history = data?.points ?? [];
 
     // Keep the most recent points if a very busy market overflows the budget.
-    const trimmed = out.length > MAX_POINTS ? out.slice(-MAX_POINTS) : out;
+    const trimmed = history.length > MAX_POINTS ? history.slice(-MAX_POINTS) : history;
 
-    // The live price is always the last point, read straight from the contract.
-    // This is what guarantees the chart is never empty and never stale at the
-    // right-hand edge, regardless of what happened to the log query.
-    return [...trimmed, { bps: currentBps, kind: 'now' as const }];
+    /*
+     * The live price is always the last point, read straight from the contract.
+     * This is what guarantees the chart is never empty and never stale at the
+     * right-hand edge, regardless of what happened to the API or the log query —
+     * indexer lag degrades HISTORY, never the current price.
+     *
+     * Its `t` is the client clock, the one timestamp here that is not indexed,
+     * and it gives the time axis its right-hand anchor. Never allowed BELOW the
+     * newest history point: a clock a few seconds slow is our clock being wrong,
+     * not the chain's, and it would otherwise draw the line doubling back.
+     */
+    const nowSec = Math.floor(Date.now() / 1000);
+    const newest = trimmed.length > 0 ? trimmed[trimmed.length - 1].t : undefined;
+    const t = newest !== undefined && newest > nowSec ? newest : nowSec;
+
+    return [...trimmed, { bps: currentBps, kind: 'now' as const, t }];
   }, [data, currentBps]);
 
   const refresh = useCallback(() => {
@@ -232,8 +445,9 @@ export function useTradeHistory(
     // we most want to be frugal. It also correctly no-ops when nothing is
     // mounted to observe the result.
     //
-    // The underlying load resumes from the cached block range, so the new request
-    // covers only blocks since the last one, not the whole window again.
+    // The underlying load is cheap to repeat: the API answers from Postgres (and
+    // schedules its own bounded catch-up), and the sweep resumes from the cached
+    // block range, so it covers only blocks since the last one.
     void queryClient.invalidateQueries({ queryKey });
   }, [queryClient, queryKey]);
 
