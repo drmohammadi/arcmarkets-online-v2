@@ -170,7 +170,7 @@ you trade with, not gas.
 ```
 arc-prediction-market/
 ├── contracts/           # Solidity + Hardhat
-│   ├── src/             # 4 contracts
+│   ├── src/             # 6 contracts
 │   ├── test/            # 19 tests
 │   └── scripts/         # deploy.ts, e2e-local.ts
 ├── frontend/            # Next.js app
@@ -178,8 +178,9 @@ arc-prediction-market/
 │   ├── components/      # Header, Footer, MarketCard, FeaturedSlider,
 │   │                    #   TradePanel, LiquidityForm, MarketImageUpload, ui
 │   ├── hooks/           # useMarkets, useMarket, useMarketImage, useHiddenMarkets
-│   └── lib/             # chains, format (6-decimal USDC), sanitize, ABIs,
-│                        #   links, marketImages, hiddenMarkets
+│   ├── lib/             # chains, format (6-decimal USDC), sanitize, ABIs,
+│   │                    #   links, marketImages, hiddenMarkets
+│   ├── db/              # Database added to increase chart data loading speed
 └── README.md            # This file
 ```
 
