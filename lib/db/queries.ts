@@ -1100,3 +1100,151 @@ export async function selectChartRows(args: ChartQueryArgs): Promise<ChartRow[]>
   return res.rows.map((r) => ({ t: Number(r.bucket), bps: r.yes_bps }));
 }
 
+/*
+ * ──────────────────────────── LEDGER (profile + leaderboard) ────────────────
+ *
+ * The same `market_events` rows the chart reads, served as TRADES instead of
+ * prices. No new table, no second indexer: `actor`, `outcome`, `collateral`,
+ * `shares`, `question_id` and `fpmm` are already stored per event, which is
+ * exactly what `lib/ledger.ts` needs.
+ *
+ * ONLY 'buy' AND 'sell'. Liquidity events are in the same table because they
+ * move reserves and therefore carry a price, but they are NOT trades: feeding
+ * them to the PnL fold would invent positions nobody took. The `kind` filter is
+ * the whole difference between this and the chart query.
+ *
+ * ASCENDING BY (block_number, log_index) — the order the contract applied them.
+ * `lib/ledger.ts` matches lots by walking trades forward, so the order is part of
+ * the result, not a presentation choice. Two events in one block share a
+ * `block_time`, so sorting by time would be non-deterministic between them.
+ */
+
+/** One trade as stored, with every amount still a string from `pg`. */
+export interface LedgerTradeRow {
+  blockNumber: bigint;
+  logIndex: number;
+  fpmm: string;
+  questionId: bigint;
+  trader: string;
+  side: 'buy' | 'sell';
+  outcome: 0 | 1;
+  collateral: bigint;
+  shares: bigint;
+}
+
+export interface LedgerQueryArgs {
+  chainId: number;
+  /** Hard cap on rows. The caller asks for one more than it wants, to detect truncation. */
+  limit: number;
+}
+
+/**
+ * Trades across every market, oldest first.
+ *
+ * NO PER-TRADER FILTER, DELIBERATELY. Both consumers go through `useTradeStats`,
+ * which folds the whole ledger once and then answers `statsFor(address)` and the
+ * leaderboard from the same result. Filtering here would serve the profile page
+ * and starve the leaderboard, and giving each its own query would fold the ledger
+ * twice. If a per-trader endpoint is ever wanted it should be a separate route
+ * with its own caller, not a parameter this one's callers never set.
+ *
+ * WHEN THE LIMIT BINDS, THE OLDEST TRADES WIN — the opposite of the chart, and
+ * deliberately so. `lib/ledger.ts` builds a cost basis by matching sells against
+ * earlier buys; handed the NEWEST N trades it would see sells whose opening buys
+ * were cut off and compute a cost basis from nothing. A truncated-but-contiguous
+ * prefix yields correct figures for the positions it covers, which is why the
+ * caller reports `partial` rather than silently showing wrong PnL.
+ */
+export async function selectLedgerTrades(args: LedgerQueryArgs): Promise<LedgerTradeRow[]> {
+  const rows = Number.isSafeInteger(args.limit) && args.limit >= 1 ? args.limit : 5000;
+
+  const res = await getPool().query<{
+    block_number: string;
+    log_index: number;
+    fpmm: string;
+    question_id: string;
+    actor: string;
+    kind: string;
+    outcome: number;
+    collateral: string;
+    shares: string;
+  }>(
+    `SELECT block_number, log_index, fpmm, question_id, actor, kind, outcome, collateral, shares
+       FROM market_events
+      WHERE chain_id = $1
+        AND kind IN ('buy', 'sell')
+        AND outcome IS NOT NULL
+      ORDER BY block_number, log_index
+      LIMIT $2`,
+    [args.chainId, rows]
+  );
+
+  const out: LedgerTradeRow[] = [];
+  for (const r of res.rows) {
+    // `numeric(78,0)` and `bigint` arrive as strings; BigInt at the boundary, so
+    // no amount passes through a JS number.
+    const outcome = r.outcome === 0 ? 0 : r.outcome === 1 ? 1 : null;
+    if (outcome === null) continue;
+    if (r.kind !== 'buy' && r.kind !== 'sell') continue;
+    out.push({
+      blockNumber: BigInt(r.block_number),
+      logIndex: r.log_index,
+      fpmm: r.fpmm,
+      questionId: BigInt(r.question_id),
+      trader: r.actor,
+      side: r.kind,
+      outcome,
+      collateral: BigInt(r.collateral),
+      shares: BigInt(r.shares),
+    });
+  }
+  return out;
+}
+
+/** Resolution payouts per market, for the figures the ledger needs at settlement. */
+export interface MarketPayoutRow {
+  questionId: bigint;
+  /**
+   * Lowercase `0x` condition id — the key `lib/ledger.ts` looks payouts up by.
+   *
+   * Carried because the ledger keys on the CONDITION, not the question: a payout
+   * is a property of the condition in `ConditionalTokens`, and `getPayouts` takes
+   * a conditionId. Returning only `question_id` would push that join into the
+   * browser for no reason.
+   */
+  conditionId: string;
+  resolved: boolean;
+  payoutYes: bigint | null;
+  payoutNo: bigint | null;
+}
+
+/**
+ * Payouts for every resolved market on a chain.
+ *
+ * Served from the index because a payout is immutable once written — the factory
+ * resolves a market once and `MarketResolved` cannot be re-emitted. The LIVE
+ * resolution check stays on RPC: a market that resolved since the last tick is
+ * resolved on chain and not yet here, and only the chain can say so.
+ */
+export async function selectMarketPayouts(chainId: number): Promise<MarketPayoutRow[]> {
+  const res = await getPool().query<{
+    question_id: string;
+    condition_id: string;
+    resolved: boolean;
+    payout_yes: string | null;
+    payout_no: string | null;
+  }>(
+    `SELECT question_id, condition_id, resolved, payout_yes, payout_no
+       FROM markets
+      WHERE chain_id = $1
+      ORDER BY question_id`,
+    [chainId]
+  );
+  return res.rows.map((r) => ({
+    questionId: BigInt(r.question_id),
+    conditionId: r.condition_id,
+    resolved: r.resolved,
+    payoutYes: r.payout_yes === null ? null : BigInt(r.payout_yes),
+    payoutNo: r.payout_no === null ? null : BigInt(r.payout_no),
+  }));
+}
