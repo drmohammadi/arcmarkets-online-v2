@@ -359,6 +359,81 @@ export function useMarketPoolsData(markets: MarketWithPositions[] | Market[]): {
 /* ──────────────────────────────── payouts ────────────────────────────────── */
 
 /**
+ * Which payout path runs, fixed at build time.
+ *
+ * A LITERAL `process.env.NEXT_PUBLIC_CHART_SOURCE` access, never a computed one
+ * (`process.env[name]`, destructuring, a helper taking the name as an argument).
+ * Next inlines only static property accesses; anything else reaches the browser
+ * as `undefined` and this would silently pin itself to the default forever.
+ * `lib/links.ts:15` documents the same trap.
+ *
+ * One flag governs every indexed read — chart, trades and payouts — so there is a
+ * single rollback lever rather than three that can disagree.
+ */
+const PAYOUT_SOURCE: 'api' | 'rpc' | 'auto' =
+  process.env.NEXT_PUBLIC_CHART_SOURCE === 'rpc'
+    ? 'rpc'
+    : process.env.NEXT_PUBLIC_CHART_SOURCE === 'auto'
+      ? 'auto'
+      : 'api';
+
+/**
+ * Indexed payouts, keyed by lowercase conditionId.
+ *
+ * Returns `null` when the index could not serve them at all, which leaves every
+ * condition to the RPC path below — the same behaviour as before this existed.
+ * Total: never throws.
+ */
+async function loadPayoutsFromApi(): Promise<Map<string, PayoutInfo> | null> {
+  try {
+    const res = await fetch('/api/markets/payouts', {
+      headers: { accept: 'application/json' },
+    });
+    if (!res.ok) return null;
+
+    const body: unknown = await res.json();
+    if (!body || typeof body !== 'object') return null;
+    // The route degrades to 200 with this flag rather than 5xx'ing; treating it
+    // as success would strand every market on "unknown".
+    if ((body as { degraded?: unknown }).degraded === true) return null;
+
+    const raw = (body as { payouts?: unknown }).payouts;
+    if (!Array.isArray(raw)) return null;
+
+    const out = new Map<string, PayoutInfo>();
+    for (const item of raw) {
+      if (!item || typeof item !== 'object') continue;
+      const p = item as {
+        conditionId?: unknown;
+        numerators?: unknown;
+        denominator?: unknown;
+      };
+      if (typeof p.conditionId !== 'string' || typeof p.denominator !== 'string') continue;
+      if (!Array.isArray(p.numerators) || p.numerators.length !== 2) continue;
+      const [yesRaw, noRaw] = p.numerators;
+      if (typeof yesRaw !== 'string' || typeof noRaw !== 'string') continue;
+
+      try {
+        const denominator = BigInt(p.denominator);
+        // Division by zero in the ledger. The contract rejects a zero sum, so
+        // this can only be a corrupt row — skipping yields "unknown", never a
+        // wrong number.
+        if (denominator <= ZERO) continue;
+        const numerators: readonly [bigint, bigint] = [BigInt(yesRaw), BigInt(noRaw)];
+        out.set(p.conditionId.toLowerCase(), { numerators, denominator });
+      } catch {
+        // BigInt() throws on a non-numeric string; one bad row must not lose
+        // the rest.
+        continue;
+      }
+    }
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Resolution payouts for RESOLVED markets only.
  *
  * An unresolved condition has a zero denominator, so querying it spends a
@@ -405,8 +480,37 @@ export function useMarketPayoutsData(markets: MarketWithPositions[] | Market[]):
     queryFn: async () => {
       if (!client || !conditionalTokens) return {};
 
+      /*
+       * THE INDEX FIRST, RPC ONLY FOR WHAT IT DOES NOT HAVE.
+       *
+       * A payout is immutable once written — `reportPayouts` reverts with
+       * `ConditionAlreadyResolved` — so an indexed payout can never be stale,
+       * only absent. Absence has one real cause: a market that resolved since
+       * the last indexer tick. Those few fall through to RPC below, which is why
+       * the live `resolved` flag driving `conditionIds` still comes from the
+       * chain and not from the database.
+       *
+       * `PAYOUT_SOURCE !== 'rpc'` gates it on the same build-time flag as the
+       * other indexed reads, so one env var rolls the whole feature back.
+       */
+      const out: Record<string, PayoutInfo> = {};
+      if (PAYOUT_SOURCE !== 'rpc') {
+        const indexed = await loadPayoutsFromApi();
+        if (indexed) {
+          for (const id of conditionIds) {
+            const hit = indexed.get(id.toLowerCase());
+            if (hit) out[id.toLowerCase()] = hit;
+          }
+        }
+      }
+
+      // Only the ones the index could not answer. On a caught-up chain this is
+      // empty and the whole payout path costs zero RPC calls.
+      const missing = conditionIds.filter((id) => !out[id.toLowerCase()]);
+      if (missing.length === 0) return out;
+
       const settled = await Promise.allSettled(
-        conditionIds.map((id) =>
+        missing.map((id) =>
           enqueueCall(() =>
             client.readContract({
               address: conditionalTokens,
@@ -418,7 +522,6 @@ export function useMarketPayoutsData(markets: MarketWithPositions[] | Market[]):
         )
       );
 
-      const out: Record<string, PayoutInfo> = {};
       settled.forEach((entry, i) => {
         if (entry.status !== 'fulfilled' || !entry.value) return;
         const [resolved, numerators, denominator] = entry.value as unknown as [
@@ -427,7 +530,7 @@ export function useMarketPayoutsData(markets: MarketWithPositions[] | Market[]):
           bigint,
         ];
         if (!resolved || denominator <= ZERO) return;
-        out[conditionIds[i]] = { numerators, denominator };
+        out[missing[i].toLowerCase()] = { numerators, denominator };
       });
       return out;
     },

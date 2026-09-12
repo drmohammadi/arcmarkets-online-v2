@@ -1,57 +1,50 @@
 'use client';
 
 /**
- * One bounded sweep of every market's Buy/Sell logs, shared by the profile page
- * and the leaderboard.
+ * Every market's Buy/Sell trades, shared by the profile page and the leaderboard.
  *
- * ── WHY ONE GLOBAL SCAN, NOT ONE PER USER ────────────────────────────────────
- * viem's `getLogs` accepts an ARRAY of addresses and an ARRAY of events, which
- * become an address filter and a topic0 OR-set in a single `eth_getLogs`. So one
- * request covers every market and both event types at once:
+ * ── THE TRADES NOW COME FROM THE INDEXER, NOT FROM `eth_getLogs` ─────────────
+ * `GET /api/trades` serves them out of `market_events`, the same table the price
+ * chart reads. That table already stores `actor`, `outcome`, `collateral`,
+ * `shares`, `question_id` and `fpmm` per event, which is exactly what
+ * `lib/ledger.ts` needs — so this needed no second indexer and no schema change,
+ * only a query.
  *
- *     getLogs({ address: [fpmm1, fpmm2, ...], events: [Buy, Sell], ... })
+ * WHAT THIS REPLACED, and why it had to go. The sweep below covered ~1.7M blocks
+ * (Arc testnet's head is past 57,000,000 while the factory sits at 55,632,013)
+ * on a 48-request budget, and — unlike the chart — it deliberately had NO early
+ * stop, because an aggregate cannot know whether the trader or position it needs
+ * lies deeper in history. So it spent its entire budget on every single load of
+ * /profile and /leaderboard. Server-side that work is paid once for all visitors.
  *
- * The cost of a scan is therefore driven by how many BLOCKS it covers, not by how
- * many markets exist — which is what makes a leaderboard viable here at all. A
- * per-market loop would have been 2N requests per block range.
+ * ── WHAT IS *NOT* SERVED FROM THE DATABASE, DELIBERATELY ─────────────────────
+ * POSITION BALANCES stay on RPC. `PortfolioPanel` reads holdings from one
+ * `balanceOfBatch` call and they are exact regardless of how far the index has
+ * reached, whereas anything ledger-derived is only as complete as the sweep
+ * behind it. CLAUDE.md records that holdings render ABOVE the PnL tiles for that
+ * reason; serving them from SQL would make them less correct, not faster.
  *
- * The per-user view is a client-side filter of the same result. Filtering
- * server-side would actually cost MORE: viem drops `args` when `events`
- * (plural) is used, so a per-user query needs one request per event type.
+ * PnL AND VOLUME are still computed in the browser by `lib/ledger.ts`, unchanged.
+ * This hook changed where the trades come from, not what is computed from them,
+ * so the figures are identical to what the sweep produced. `lib/ledger.ts`'s
+ * execution-price definition does NOT flip NO trades to the YES side and must
+ * stay distinct from the chart's marginal price — see the note at the top of that
+ * file. Reimplementing the lot-matching fold in SQL would have duplicated a
+ * subtle accounting model in two languages for no gain.
  *
- * ── WHAT WAS BROKEN ──────────────────────────────────────────────────────────
- * The sweep never knew where the markets were, so it could not reach them.
- *
- * First it covered a FIXED 54,000 blocks below the chain head — anchored to the
- * HEAD rather than to the markets, so once the chain grew past it every trade fell
- * outside and the sweep returned nothing.
- *
- * Replacing that with a growing, persisted range fixed the shape but not the
- * reach. It still began at the head and crawled backward with no real floor, at
- * 20,000 blocks per request with a 32-request cap — 640,000 blocks per load. Arc
- * testnet's head is past 57,000,000 while the factory sits at 55,632,013, about
- * 1.7M blocks back, so a load stopped roughly 1M blocks short of the first
- * market. Worse, the cache was sessionStorage, so the partial depth was discarded
- * whenever the tab closed and the crawl restarted from the head forever.
- * /leaderboard therefore reported "no trades in the scanned window" — which reads
- * as "nobody has ever traded" — on a chain with plenty of trades, and /profile
- * said the same. Both were reported as broken, and this was why.
- *
- * Now: `floor` is the factory's DEPLOYMENT BLOCK, an exact bound rather than a
- * guess, so the range is closed at ~1.7M blocks; the chunk opens at the
- * endpoint's real ceiling instead of a sixth of it, so that range costs ~15
- * requests rather than ~85; and the cache is durable, so depth is paid once per
- * browser. `lib/logScan.ts` owns the sweep and is shared with the price chart.
- *
- * Unlike the chart, this sweep does NOT stop early once it has "enough" events:
- * an aggregate cannot know whether the trader or the position it needs is deeper
- * in history, so it spends its whole budget.
+ * ── THE SWEEP BELOW IS A PERMANENT FALLBACK, NOT DEAD CODE ───────────────────
+ * `NEXT_PUBLIC_CHART_SOURCE` picks the path: `api` (default), `rpc`, or `auto`
+ * (the API, then the sweep if it fails). One flag governs both indexer-backed
+ * reads so there is a single rollback lever. Neon's free tier suspends on quota
+ * and the daily cron lets it sleep, so a leaderboard that degrades to
+ * slow-but-working beats one that shows nothing. Do not delete `loadLedger`,
+ * `sweepLogs`, `toTrade` or the event definitions.
  *
  * ── NEVER FAILS VISIBLY ──────────────────────────────────────────────────────
- * Like useTradeHistory, this hook does not surface errors. A failed or
- * rate-limited scan returns whatever it gathered and sets `partial`, which the
- * pages label. A truncated leaderboard is honest; an empty one that reads as
- * "nobody has traded" is not.
+ * This hook does not surface errors. A failed read returns whatever it has and
+ * sets `partial`, which the pages label. A truncated leaderboard is honest; an
+ * empty one that reads as "nobody has traded" is not — that was the original bug
+ * and the reason `partial` exists.
  */
 
 import { useCallback, useMemo } from 'react';
@@ -78,6 +71,30 @@ const EV_BUY = parseAbiItem(
 const EV_SELL = parseAbiItem(
   'event Sell(address indexed seller, uint256 outcome, uint256 returnAmount, uint256 sharesIn)'
 );
+
+/**
+ * Which path runs, fixed at build time.
+ *
+ * A LITERAL `process.env.NEXT_PUBLIC_CHART_SOURCE` access, never a computed one.
+ * Next inlines only static property accesses; anything else reaches the browser
+ * as `undefined` and this would silently pin itself to the default forever.
+ * `lib/links.ts:15` documents the same trap.
+ */
+const LEDGER_SOURCE: 'api' | 'rpc' | 'auto' =
+  process.env.NEXT_PUBLIC_CHART_SOURCE === 'rpc'
+    ? 'rpc'
+    : process.env.NEXT_PUBLIC_CHART_SOURCE === 'auto'
+      ? 'auto'
+      : 'api';
+
+/**
+ * Rows asked of the API.
+ *
+ * Matches `lib/logScan.ts`'s own `maxEvents` default, so the indexed path returns
+ * at least as much history as the sweep it replaces.
+ */
+const API_LIMIT = 5000;
+
 
 /**
  * First range size tried per request, halved automatically when refused.
@@ -114,6 +131,15 @@ const MAX_REQUESTS = 48;
 const MAX_ADDRESSES = 100;
 
 interface LedgerData {
+  /**
+   * Trades from the API, already carrying their `questionId` from the database.
+   *
+   * `null` means the API path did not produce them — either it was skipped or it
+   * failed — and `events` below is the source instead. The two are kept separate
+   * rather than merged because the RPC path has no questionId and must be joined
+   * against the caller's market list, which is NOT part of the query key.
+   */
+  trades: LedgerTrade[] | null;
   events: CachedEvent[];
   /** True when a range could not be read, so coverage has a hole. */
   incomplete: boolean;
@@ -122,6 +148,28 @@ interface LedgerData {
   /** Blocks actually covered, for an honest "covers the last N blocks" note. */
   covered: bigint;
 }
+
+/** The subset of `/api/trades` this hook relies on. */
+interface ApiTrade {
+  blockNumber: string;
+  logIndex: number;
+  fpmm: string;
+  questionId: string;
+  trader: string;
+  side: 'buy' | 'sell';
+  outcome: 0 | 1;
+  collateral: string;
+  shares: string;
+}
+
+const EMPTY_LEDGER: LedgerData = {
+  trades: null,
+  events: [],
+  incomplete: false,
+  reachedFloor: false,
+  covered: BigInt(0),
+};
+
 
 export interface TradeLedger {
   /** Every scanned trade, in chain order. */
@@ -176,7 +224,15 @@ export function useTradeLedger(markets: Market[]): TradeLedger {
     return map;
   }, [markets]);
 
-  const enabled = !!client && addresses.length > 0;
+  /*
+   * The indexed path needs neither a client nor a non-empty market list, so it
+   * stays enabled where the sweep could not run at all. That is a real
+   * behavioural gain rather than a technicality: on a cold load `useMarketsData`
+   * has not resolved yet, `addresses` is empty, and the old hook sat disabled
+   * until it did.
+   */
+  const enabled = LEDGER_SOURCE !== 'rpc' || (!!client && addresses.length > 0);
+
 
   const queryKey = useMemo(
     () => ['tradeLedger', chainId, addressKey] as const,
@@ -195,14 +251,31 @@ export function useTradeLedger(markets: Market[]): TradeLedger {
     // at exactly the moment the RPC is asking us to slow down.
     retry: false,
     queryFn: async () => {
-      if (!client || addresses.length === 0) {
-        return { events: [], incomplete: false, reachedFloor: false, covered: BigInt(0) };
+      /*
+       * The API path first, and it does NOT need a wallet client or the market
+       * address list — the database already joins `question_id` onto every row.
+       * So it runs even when `addresses` is empty, which the sweep cannot do.
+       */
+      if (LEDGER_SOURCE !== 'rpc') {
+        const fromApi = await loadLedgerFromApi();
+        if (fromApi) return fromApi;
+        // `api` is strict: no silent fall-through to the expensive path. Only
+        // `auto` degrades, and only after the API has actually failed.
+        if (LEDGER_SOURCE === 'api') {
+          return { ...EMPTY_LEDGER, incomplete: true };
+        }
       }
+
+      if (!client || addresses.length === 0) return EMPTY_LEDGER;
       return loadLedger(client, chainId, addresses, addressKey);
     },
   });
 
   const trades = useMemo(() => {
+    // The API already carries `questionId` per row, so its trades are used as
+    // they are. Only the sweep's raw events need the fpmm -> questionId join.
+    if (data?.trades) return data.trades;
+
     const out: LedgerTrade[] = [];
     for (const ev of data?.events ?? []) {
       const trade = toTrade(ev, questionIdByFpmm);
@@ -227,9 +300,120 @@ export function useTradeLedger(markets: Market[]): TradeLedger {
   };
 }
 
-/** Decode one cached event into a ledger trade, or null if it is unusable. */
-function toTrade(ev: CachedEvent, byFpmm: Map<string, bigint>): LedgerTrade | null {
+/**
+ * Read trades from `/api/trades`.
+ *
+ * Returns `null` when the indexed path could not serve them, which is the signal
+ * for `auto` to fall back to the sweep. Total: never throws.
+ *
+ * `degraded: true` in the response means the API reached us but Postgres did not
+ * answer it, so it counts as a failure here even though the HTTP status was 200 —
+ * that route deliberately degrades rather than 5xx'ing, and treating its 200 as
+ * success would strand the caller with an empty leaderboard.
+ */
+async function loadLedgerFromApi(): Promise<LedgerData | null> {
   try {
+    const res = await fetch(`/api/trades?limit=${API_LIMIT}`, {
+      headers: { accept: 'application/json' },
+    });
+    if (!res.ok) return null;
+
+    const body: unknown = await res.json();
+    if (!body || typeof body !== 'object') return null;
+
+    const meta = (body as { meta?: unknown }).meta;
+    const metaObj = meta && typeof meta === 'object' ? (meta as Record<string, unknown>) : {};
+    if (metaObj.degraded === true) return null;
+
+    const raw = (body as { trades?: unknown }).trades;
+    if (!Array.isArray(raw)) return null;
+
+    const trades: LedgerTrade[] = [];
+    for (const item of raw) {
+      const trade = fromApiTrade(item);
+      if (trade) trades.push(trade);
+    }
+
+    /*
+     * Coverage comes from the INDEX's own range, not from a browser sweep: the
+     * anchored floor through the checkpoint. That is strictly more honest than
+     * what the sweep could report, which was only the window one tab had managed
+     * to crawl.
+     */
+    const fromBlock = toBig(metaObj.fromBlock);
+    const toBlock = toBig(metaObj.toBlock);
+    const covered =
+      fromBlock !== null && toBlock !== null && toBlock >= fromBlock
+        ? toBlock - fromBlock + BigInt(1)
+        : BigInt(0);
+
+    return {
+      trades,
+      events: [],
+      // `truncated` is the row cap binding, which leaves the tail of history out
+      // of this response — the same fact `partial` has always described.
+      incomplete: metaObj.truncated === true,
+      reachedFloor: metaObj.complete === true,
+      covered,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** One API row into a `LedgerTrade`, or null when it is not usable. */
+function fromApiTrade(item: unknown): LedgerTrade | null {
+  try {
+    if (!item || typeof item !== 'object') return null;
+    const t = item as Partial<ApiTrade>;
+
+    const fpmm = safeAddress(t.fpmm);
+    const trader = safeAddress(t.trader);
+    if (!fpmm || !trader) return null;
+    if (t.side !== 'buy' && t.side !== 'sell') return null;
+    if (t.outcome !== 0 && t.outcome !== 1) return null;
+    if (typeof t.blockNumber !== 'string' || typeof t.questionId !== 'string') return null;
+    if (typeof t.logIndex !== 'number' || !Number.isSafeInteger(t.logIndex)) return null;
+    if (typeof t.collateral !== 'string' || typeof t.shares !== 'string') return null;
+
+    const collateral = BigInt(t.collateral);
+    const shares = BigInt(t.shares);
+    // The same guard the sweep applies: a zero-amount fill has no price and
+    // would divide by zero in `lib/ledger.ts`.
+    if (collateral <= BigInt(0) || shares <= BigInt(0)) return null;
+
+    return {
+      blockNumber: BigInt(t.blockNumber),
+      logIndex: t.logIndex,
+      fpmm,
+      questionId: BigInt(t.questionId),
+      trader,
+      side: t.side,
+      outcome: t.outcome,
+      collateral,
+      shares,
+    };
+  } catch {
+    // BigInt() throws on a non-numeric string; one bad row must not lose the rest.
+    return null;
+  }
+}
+
+/** A JSON block number — a number when it fits one, else a decimal string. */
+function toBig(value: unknown): bigint | null {
+  try {
+    if (typeof value === 'number') {
+      return Number.isSafeInteger(value) && value >= 0 ? BigInt(value) : null;
+    }
+    if (typeof value === 'string' && /^[0-9]+$/.test(value)) return BigInt(value);
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Decode one cached event into a ledger trade, or null if it is unusable. */
+function toTrade(ev: CachedEvent, byFpmm: Map<string, bigint>): LedgerTrade | null {  try {
     const fpmm = safeAddress(ev.address);
     const trader = safeAddress(ev.args.buyer ?? ev.args.seller);
     if (!fpmm || !trader) return null;
@@ -278,7 +462,7 @@ async function loadLedger(
   try {
     latest = await enqueueRpc(() => client.getBlockNumber());
   } catch {
-    return { events: [], incomplete: true, reachedFloor: false, covered: BigInt(0) };
+    return { ...EMPTY_LEDGER, incomplete: true };
   }
 
   /*
@@ -355,6 +539,10 @@ async function loadLedger(
     : BigInt(0);
 
   return {
+    // Null, not an empty array: the sweep produces raw events and the caller must
+    // join them against its market list. An empty array here would read as
+    // "the API returned no trades" and skip that join.
+    trades: null,
     events: result.events,
     incomplete: result.incomplete,
     reachedFloor: result.reachedFloor,
