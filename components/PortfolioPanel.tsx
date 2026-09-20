@@ -7,10 +7,12 @@ import { StaleNotice } from '@/components/StaleNotice';
 import { useMarketsData, useWalletPositions } from '@/hooks/useChainData';
 import { useMarketPools } from '@/hooks/useMarketPools';
 import { useMarketMetadataBatch } from '@/hooks/useMarketMetadata';
+import { useMarketPayouts } from '@/hooks/useMarketPayouts';
 import { formatUsdc } from '@/lib/format';
 import { formatProbPct } from '@/lib/pricing';
 import { parseQuestion } from '@/lib/eventGroups';
 import { formatResolutionDate } from '@/lib/time';
+import { redeemableAmount } from '@/lib/redeemable';
 import { useHiddenMarkets } from '@/hooks/useMarketImage';
 
 const ZERO = BigInt(0);
@@ -90,21 +92,78 @@ export function PortfolioPanel({ address }: { address: `0x${string}` }) {
     [heldPositions, marketById, hidden]
   );
 
-  // Current mark-to-market value: each share is worth its implied probability
-  // until resolution. This is an estimate of exit value, not a guaranteed price.
+  /*
+   * Payouts are read for the markets this WALLET holds, not for every market on
+   * the chain.
+   *
+   * `useMarketPayouts` fetches the index once, then falls back to one RPC
+   * `getPayouts` per condition the index cannot answer. Passing the full market
+   * list therefore scaled that fallback with the chain rather than with the
+   * position count -- 200 resolved markets cost 200 reads for a wallet holding
+   * two of them. This hook sits below `positions` for exactly that reason; the
+   * call is still unconditional, so hook order is stable.
+   */
+  const heldMarkets = useMemo(() => positions.map((p) => p.market), [positions]);
+  const { payoutFor, isLoading: payoutsLoading } = useMarketPayouts(heldMarkets);
+
+  /*
+   * Two quantities, and the split is by RESOLUTION, not by which tile it feeds.
+   *
+   * An unresolved position is an estimate: a share is worth its implied
+   * probability, which is the best available guess at exit value. A RESOLVED
+   * position is not an estimate at all -- it is worth exactly what the contract
+   * will pay, which is zero for the losing side.
+   *
+   * So both tiles use the payout once a market resolves. An earlier version fixed
+   * only `redeemable` and left `value` marking resolved positions at the last pool
+   * price, which meant "Estimated value" still inflated wiped-out holdings with
+   * precisely the bug `lib/redeemable.ts` exists to kill -- directly under copy
+   * saying losing shares are shown as worthless.
+   *
+   * `unknownPayouts` counts markets that ARE resolved but whose numerators have
+   * not arrived. Those are excluded from BOTH totals rather than guessed:
+   * `payoutFor` returning null means "we do not know", explicitly not "zero".
+   */
   const totals = useMemo(() => {
     let value = ZERO;
     let redeemable = ZERO;
+    let unknownPayouts = 0;
     for (const p of positions) {
-      const pool = poolFor(p.market.questionId);
-      const yesBps = BigInt(pool.yesBps);
-      const noBps = BigInt(10000 - pool.yesBps);
-      const v = (p.yes * yesBps + p.no * noBps) / BigInt(10000);
-      value += v;
-      if (p.market.resolved) redeemable += v;
+      if (!p.market.resolved) {
+        const pool = poolFor(p.market.questionId);
+        const yesBps = BigInt(pool.yesBps);
+        const noBps = BigInt(10000 - pool.yesBps);
+        value += (p.yes * yesBps + p.no * noBps) / BigInt(10000);
+        continue;
+      }
+
+      const payout = payoutFor(p.market.conditionId);
+      if (!payout) {
+        unknownPayouts += 1;
+        continue;
+      }
+      const amount = redeemableAmount({
+        yes: p.yes,
+        no: p.no,
+        numerators: payout.numerators,
+        denominator: payout.denominator,
+      });
+      value += amount;
+      redeemable += amount;
     }
-    return { value, redeemable };
-  }, [positions, poolFor]);
+    return { value, redeemable, unknownPayouts };
+  }, [positions, poolFor, payoutFor]);
+
+  /*
+   * "Still loading" and "failed to load" must not look the same.
+   *
+   * During the normal initial fetch every resolved position is briefly unknown,
+   * so keying the caveat on `unknownPayouts` alone made the "(partial)" label and
+   * its banner flash on every single page load. Gating on `!payoutsLoading` means
+   * the warning appears only when the data genuinely did not arrive -- which is
+   * the distinction `useMarketPayouts` documents and this panel was discarding.
+   */
+  const payoutsIncomplete = !payoutsLoading && totals.unknownPayouts > 0;
 
   const loading = isLoading || balLoading;
   const stale = marketsStale || poolsStale || balancesStale;
@@ -141,14 +200,29 @@ export function PortfolioPanel({ address }: { address: `0x${string}` }) {
             and so is the right thing to drop first at narrow widths.
           */}
           <div className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-3">
-            <SummaryTile label="Estimated value" value={`$${formatUsdc(totals.value)}`} />
-            <SummaryTile label="Redeemable now" value={`$${formatUsdc(totals.redeemable)}`} />
+            <SummaryTile
+              label={payoutsIncomplete ? 'Estimated value (partial)' : 'Estimated value'}
+              value={`$${formatUsdc(totals.value)}`}
+            />
+            <SummaryTile
+              label={payoutsIncomplete ? 'Redeemable now (partial)' : 'Redeemable now'}
+              value={`$${formatUsdc(totals.redeemable)}`}
+            />
             <SummaryTile
               label="Open positions"
               value={String(positions.length)}
               className="col-span-2 sm:col-span-1"
             />
           </div>
+
+          {payoutsIncomplete && (
+            <p className="mb-4 text-2xs leading-relaxed text-content-muted" role="status">
+              {totals.unknownPayouts} resolved{' '}
+              {totals.unknownPayouts === 1 ? 'market has' : 'markets have'} no payout data
+              available, so {totals.unknownPayouts === 1 ? 'it is' : 'they are'} excluded from both
+              totals rather than estimated.
+            </p>
+          )}
 
           <ul className="space-y-2">
             {positions.map(({ market, yes, no }) => {
@@ -193,20 +267,37 @@ export function PortfolioPanel({ address }: { address: `0x${string}` }) {
                         </span>
                       </div>
                     </div>
-                    {market.resolved ? (
-                      <Badge tone="brand">Redeemable</Badge>
-                    ) : (
-                      <Badge tone="neutral">Open</Badge>
-                    )}
+                    {(() => {
+                      // "Redeemable" must mean money is actually waiting. A
+                      // resolved market where this wallet held the losing side
+                      // pays zero, and labelling that Redeemable sends people to
+                      // a button that reverts with NoWinningShares.
+                      if (!market.resolved) return <Badge tone="neutral">Open</Badge>;
+                      const payout = payoutFor(market.conditionId);
+                      if (!payout) return <Badge tone="neutral">Resolved</Badge>;
+                      const amount = redeemableAmount({
+                        yes,
+                        no,
+                        numerators: payout.numerators,
+                        denominator: payout.denominator,
+                      });
+                      return amount > ZERO ? (
+                        <Badge tone="brand">Redeemable</Badge>
+                      ) : (
+                        <Badge tone="neutral">No payout</Badge>
+                      );
+                    })()}
                   </Link>
                 </li>
               );
             })}
           </ul>
 
-          <p className="mt-4 text-2xs text-content-subtle">
-            Estimated value marks each share at the pool&apos;s current implied probability. Actual
-            proceeds depend on liquidity and slippage at the time you sell.
+          <p className="mt-4 text-2xs leading-relaxed text-content-subtle">
+            Open positions are marked at the pool&apos;s current implied probability, so actual
+            proceeds depend on liquidity and slippage at the time you sell. Resolved positions are
+            not estimated at all &mdash; both figures use what the contract will actually pay, so
+            losing shares count as nothing.
           </p>
         </>
       )}
