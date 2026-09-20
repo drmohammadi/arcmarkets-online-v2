@@ -13,10 +13,13 @@ import { useMarket } from '@/hooks/useMarket';
 import { useMarkets } from '@/hooks/useMarkets';
 import { useMarketPools } from '@/hooks/useMarketPools';
 import { usePosition } from '@/hooks/usePosition';
+import { useMarketPayouts } from '@/hooks/useMarketPayouts';
 import { useTradeHistory } from '@/hooks/useTradeHistory';
 import { useMarketImage, useHiddenMarkets } from '@/hooks/useMarketImage';
 import { useMarketMetadata } from '@/hooks/useMarketMetadata';
 import { conditionalTokensAbi } from '@/lib/abis';
+import { redeemableAmount } from '@/lib/redeemable';
+import type { PayoutInfo } from '@/lib/ledger';
 import { sanitizeText, shortAddress } from '@/lib/sanitize';
 import { formatUsdc, formatUsdcCompact } from '@/lib/format';
 import { yesProbBps, formatProbPct, sharePriceUsdc } from '@/lib/pricing';
@@ -56,6 +59,21 @@ export default function MarketPage() {
   const { markets } = useMarkets();
   const { poolFor } = useMarketPools(markets);
   const position = usePosition(market.fpmm, market.conditionalTokens);
+
+  /*
+   * Payouts for THIS market only.
+   *
+   * `useMarketPayouts` falls back to one RPC `getPayouts` per condition the index
+   * cannot answer, so handing it the whole market list would scale that with the
+   * chain instead of with the single market on screen.
+   */
+  const thisMarket = useMemo(
+    () => (questionId === null ? [] : markets.filter((m) => m.questionId === questionId)),
+    [markets, questionId]
+  );
+  const { payoutFor, isLoading: payoutLoading } = useMarketPayouts(thisMarket);
+  const payout = payoutFor(market.conditionId);
+
   const storedImage = useMarketImage(questionId);
   const metadata = useMarketMetadata(questionId);
   // Shared on-chain image wins over the per-browser localStorage upload.
@@ -314,6 +332,8 @@ export default function MarketPage() {
             yesShares={position.yesShares}
             noShares={position.noShares}
             resolved={market.resolved}
+            payout={payout}
+            payoutLoading={payoutLoading}
             conditionalTokens={market.conditionalTokens}
             collateralToken={market.collateralToken}
             conditionId={market.conditionId as `0x${string}` | undefined}
@@ -500,6 +520,8 @@ function PositionCard({
   yesShares,
   noShares,
   resolved,
+  payout,
+  payoutLoading,
   conditionalTokens,
   collateralToken,
   conditionId,
@@ -508,6 +530,9 @@ function PositionCard({
   yesShares: bigint;
   noShares: bigint;
   resolved: boolean;
+  /** Reported numerators, or null while unknown. Null is NOT zero. */
+  payout: PayoutInfo | null;
+  payoutLoading: boolean;
   conditionalTokens: `0x${string}` | undefined;
   collateralToken: `0x${string}` | undefined;
   conditionId: `0x${string}` | undefined;
@@ -523,6 +548,22 @@ function PositionCard({
   }, [isSuccess, onRedeemed]);
 
   if (yesShares <= BigInt(0) && noShares <= BigInt(0)) return null;
+
+  /*
+   * What `redeemPositions` would actually pay this wallet, from the reported
+   * numerators -- zero for a losing position. Computed after the no-shares early
+   * return and before any branch that offers the button, so the button and the
+   * amount can never describe different things.
+   */
+  const redeemable =
+    payout === null
+      ? BigInt(0)
+      : redeemableAmount({
+          yes: yesShares,
+          no: noShares,
+          numerators: payout.numerators,
+          denominator: payout.denominator,
+        });
 
   function handleRedeem() {
     if (!conditionalTokens || !collateralToken || !conditionId) {
@@ -566,16 +607,43 @@ function PositionCard({
         )}
       </div>
 
-      {resolved && (
-        <button
-          type="button"
-          onClick={handleRedeem}
-          disabled={working}
-          className="mt-3 h-9 rounded-lg bg-brand px-4 text-xs font-semibold text-white transition-colors hover:bg-brand-hover disabled:opacity-50"
-        >
-          {working ? 'Redeeming…' : 'Redeem winnings'}
-        </button>
-      )}
+      {resolved &&
+        (payout === null ? (
+          /*
+           * Resolved, but the numerators have not arrived. Offering the button
+           * here would be a guess; suppressing the card entirely would hide a
+           * real payout. Say which it is instead.
+           */
+          <p className="mt-3 text-xs text-content-muted" role="status">
+            {payoutLoading
+              ? 'Checking what this position pays…'
+              : 'Payout data for this market could not be loaded, so the redeemable amount is unknown. Reload to try again.'}
+          </p>
+        ) : redeemable > BigInt(0) ? (
+          <>
+            <button
+              type="button"
+              onClick={handleRedeem}
+              disabled={working}
+              className="mt-3 h-9 rounded-lg bg-brand px-4 text-xs font-semibold text-white transition-colors hover:bg-brand-hover disabled:opacity-50"
+            >
+              {working ? 'Redeeming…' : `Redeem $${formatUsdc(redeemable)}`}
+            </button>
+            <p className="mt-1.5 text-2xs text-content-subtle">
+              Exact amount from the reported payouts, not an estimate.
+            </p>
+          </>
+        ) : (
+          /*
+           * Resolved and worth nothing. The button used to render here and
+           * revert with NoWinningShares on click -- the user learned the outcome
+           * from a failed transaction. `redeemPositions` reverts when the payout
+           * is zero (ConditionalTokens.sol:137), so there is nothing to offer.
+           */
+          <p className="mt-3 text-xs text-content-muted">
+            This market resolved against your position, so there is nothing to redeem.
+          </p>
+        ))}
 
       {error && (
         <div className="mt-3">
