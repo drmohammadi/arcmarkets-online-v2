@@ -22,6 +22,7 @@ import { sanitizeText, safeAddress } from '@/lib/sanitize';
 import { safeImageUrl } from '@/lib/links';
 import { hideMarket, unhideMarket } from '@/lib/hiddenMarkets';
 import { parseQuestion } from '@/lib/eventGroups';
+import { resolveBlocker, type ResolveBlocker } from '@/lib/resolveEligibility';
 import {
   MAX_DESCRIPTION_BYTES,
   MAX_SOURCE_BYTES,
@@ -59,6 +60,23 @@ export default function AdminPage() {
 
   const isOwner =
     !!address && !!owner && address.toLowerCase() === (owner as string).toLowerCase();
+
+  /*
+   * `resolveMarket` is `whenNotPaused` (MarketFactory.sol:107), and pausing the
+   * factory also pauses ConditionalTokens, so `reportPayouts` would refuse too.
+   * Without this read the panel enabled resolve buttons that could only revert.
+   *
+   * A failed read yields undefined, which is treated as NOT paused: the contract
+   * still refuses, so the cost is a clear revert rather than a whole panel
+   * disabled by an RPC hiccup.
+   */
+  const { data: factoryPaused } = useReadContract({
+    address: deployment?.marketFactory as `0x${string}` | undefined,
+    abi: marketFactoryAbi,
+    functionName: 'paused',
+    query: { enabled: !!deployment },
+  });
+  const paused = factoryPaused === true;
 
   const { markets } = useMarkets();
   const hidden = useHiddenMarkets();
@@ -748,6 +766,9 @@ export default function AdminPage() {
                   rawQuestion={m.question}
                   resolutionTime={m.resolutionTime}
                   resolved={m.resolved}
+                  resolver={m.resolver}
+                  connected={address}
+                  paused={paused}
                   hidden={hidden.has(m.questionId.toString())}
                   chainId={chainId}
                   collateralToken={deployment?.collateralToken}
@@ -885,6 +906,38 @@ function IconButton({
   );
 }
 
+/**
+ * Turns a resolve blocker into a button tooltip.
+ *
+ * `null` means the action is available, so it deliberately yields `undefined`
+ * rather than an empty string -- React omits the attribute entirely, and a blank
+ * tooltip on an enabled button is worse than none.
+ *
+ * Every variant is listed explicitly and the default asserts `never`, so adding a
+ * blocker to the union without a message here is a COMPILE error rather than a
+ * silently disabled button with no explanation.
+ */
+function blockerTitle(blocker: ResolveBlocker): string | undefined {
+  switch (blocker) {
+    case null:
+      return undefined;
+    case 'not-expired':
+      return 'Locked until the resolution time';
+    case 'not-resolver':
+      return "Only this market's resolver can resolve it";
+    case 'not-connected':
+      return 'Connect a wallet to resolve';
+    case 'already-resolved':
+      return 'This market is already resolved';
+    case 'paused':
+      return 'The factory is paused, so no market can be resolved';
+    default: {
+      const exhaustive: never = blocker;
+      return exhaustive;
+    }
+  }
+}
+
 /** One market in the manage list: status, image, hide, resolve, liquidity. */
 function MarketRow({
   questionId,
@@ -892,6 +945,9 @@ function MarketRow({
   rawQuestion,
   resolutionTime,
   resolved,
+  resolver,
+  connected,
+  paused,
   hidden,
   chainId,
   collateralToken,
@@ -903,6 +959,9 @@ function MarketRow({
   rawQuestion: string;
   resolutionTime: bigint;
   resolved: boolean;
+  resolver: string;
+  connected: string | undefined;
+  paused: boolean;
   hidden: boolean;
   chainId: number;
   collateralToken: string | undefined;
@@ -912,9 +971,30 @@ function MarketRow({
   const [confirmingHide, setConfirmingHide] = useState(false);
   const title = sanitizeText(rawQuestion) || 'Untitled';
   const parsed = parseQuestion(rawQuestion);
-  // Recomputed per render rather than held in state: this is a display-only
-  // comparison, and putting Date.now() in state would need a timer to stay true.
-  const past = Date.now() / 1000 >= Number(resolutionTime);
+  /*
+   * `blocker` is the single source of truth for whether resolving is possible,
+   * and the badge is derived from it -- so the green "Ready to resolve" can only
+   * appear when the buttons beside it are actually enabled.
+   *
+   * An earlier version computed `past` separately and keyed the badge off that,
+   * which rendered "Ready to resolve" above two disabled buttons whenever the
+   * connected wallet was not this market's resolver. `expired` still exists, but
+   * only to distinguish "not yet open" from "open but blocked for this wallet" --
+   * it never decides whether the action is available.
+   *
+   * Date.now() is read per render: this is display-only, and holding it in state
+   * would need a timer to stay true.
+   */
+  const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  const blocker = resolveBlocker({
+    connected,
+    resolver,
+    resolved,
+    resolutionTime,
+    nowSec,
+    paused,
+  });
+  const expired = nowSec >= resolutionTime;
 
   return (
     <li className="rounded-card border border-edge bg-surface-raised p-4">
@@ -922,8 +1002,10 @@ function MarketRow({
         <span className="text-2xs tabular-nums text-content-subtle">#{questionId.toString()}</span>
         {resolved ? (
           <Badge tone="brand">Resolved</Badge>
-        ) : past ? (
+        ) : blocker === null ? (
           <Badge tone="yes">Ready to resolve</Badge>
+        ) : expired ? (
+          <Badge tone="warn">Awaiting resolution</Badge>
         ) : (
           <Badge tone="neutral">Open</Badge>
         )}
@@ -943,8 +1025,8 @@ function MarketRow({
             <button
               type="button"
               onClick={() => onResolve(questionId, true)}
-              disabled={busy || !past}
-              title={past ? undefined : 'Locked until the resolution time'}
+              disabled={busy || blocker !== null}
+              title={blockerTitle(blocker)}
               className="h-9 rounded-lg bg-yes px-4 text-xs font-semibold text-white transition-opacity hover:opacity-90 disabled:opacity-40"
             >
               YES wins
@@ -952,8 +1034,8 @@ function MarketRow({
             <button
               type="button"
               onClick={() => onResolve(questionId, false)}
-              disabled={busy || !past}
-              title={past ? undefined : 'Locked until the resolution time'}
+              disabled={busy || blocker !== null}
+              title={blockerTitle(blocker)}
               className="h-9 rounded-lg bg-no px-4 text-xs font-semibold text-white transition-opacity hover:opacity-90 disabled:opacity-40"
             >
               NO wins
@@ -1008,6 +1090,22 @@ function MarketRow({
           </button>
         )}
       </div>
+
+      {blocker === 'not-resolver' && (
+        <p className="mt-2 text-2xs leading-relaxed text-content-muted">
+          Only this market&apos;s resolver can resolve it, and that is not the connected
+          wallet. Required:{' '}
+          <span className="font-mono">{safeAddress(resolver) ?? 'unreadable address'}</span>. Owning
+          the factory does not override this &mdash; the check is in the contract.
+        </p>
+      )}
+
+      {blocker === 'paused' && (
+        <p className="mt-2 text-2xs leading-relaxed text-content-muted">
+          The factory is paused, so no market can be resolved. Unpause it first &mdash; pausing
+          also pauses ConditionalTokens, which is what reports the payouts.
+        </p>
+      )}
 
       {confirmingHide && !hidden && (
         <p className="mt-2 text-2xs leading-relaxed text-content-muted">
