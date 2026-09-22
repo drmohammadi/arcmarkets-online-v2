@@ -1248,3 +1248,170 @@ export async function selectMarketPayouts(chainId: number): Promise<MarketPayout
     payoutNo: r.payout_no === null ? null : BigInt(r.payout_no),
   }));
 }
+
+
+/* ──────────────────────── admin curation flags ──────────────────────────── */
+
+/**
+ * Admin-authored deletion state. Kept in its own tables rather than as columns
+ * on `markets`, because `markets` is a projection the indexer rewrites and
+ * these flags cannot be reconstructed from anything. See 002_market_admin_flags.sql.
+ */
+
+/** Bound the nonce TTL so a caller cannot mint a credential that lasts forever. */
+const MIN_NONCE_TTL_SECONDS = 30;
+const MAX_NONCE_TTL_SECONDS = 900;
+
+/** How many expired nonces one issue call may sweep. Bounded so issuing stays O(1)-ish. */
+const NONCE_SWEEP_LIMIT = 200;
+
+/**
+ * Record a freshly minted nonce and return its expiry.
+ *
+ * Also sweeps expired rows opportunistically, under a LIMIT so a long-neglected
+ * table cannot turn a nonce request into a full-table delete. The sweep is a
+ * separate statement and its failure is not fatal — a nonce that was issued but
+ * whose housekeeping failed is still perfectly usable.
+ */
+export async function issueAdminNonce(nonce: string, ttlSeconds: number): Promise<Date> {
+  const ttl = Math.min(
+    MAX_NONCE_TTL_SECONDS,
+    Math.max(MIN_NONCE_TTL_SECONDS, Math.floor(ttlSeconds))
+  );
+  const res = await getPool().query<{ expires_at: Date }>(
+    `INSERT INTO admin_nonces (nonce, expires_at)
+          VALUES ($1, now() + make_interval(secs => $2::double precision))
+     ON CONFLICT (nonce) DO NOTHING
+       RETURNING expires_at`,
+    [nonce, ttl]
+  );
+  if (res.rowCount !== 1) {
+    // 32 random bytes colliding is not a thing that happens; treat it as a bug
+    // rather than silently handing back a nonce someone else may already hold.
+    throw new Error('nonce collision');
+  }
+
+  try {
+    await getPool().query(
+      `DELETE FROM admin_nonces
+             WHERE nonce IN (
+               SELECT nonce FROM admin_nonces WHERE expires_at < now() LIMIT $1
+             )`,
+      [NONCE_SWEEP_LIMIT]
+    );
+  } catch {
+    // Housekeeping only.
+  }
+
+  return res.rows[0].expires_at;
+}
+
+/**
+ * Consume a nonce, returning whether it was valid and unused.
+ *
+ * ONE STATEMENT, DELIBERATELY. A SELECT-then-UPDATE pair can interleave: two
+ * concurrent requests both read `used_at IS NULL`, both pass, both write, and
+ * the signature has been replayed. `UPDATE ... WHERE used_at IS NULL RETURNING`
+ * makes the check and the consumption the same atomic act, so exactly one caller
+ * can ever win.
+ *
+ * Expiry is compared against the DATABASE's now(), never a client clock or even
+ * this process's clock — the value being checked was minted by the same clock.
+ */
+export async function consumeAdminNonce(nonce: string): Promise<boolean> {
+  if (typeof nonce !== 'string' || nonce.length === 0 || nonce.length > 256) return false;
+  const res = await getPool().query(
+    `UPDATE admin_nonces
+        SET used_at = now()
+      WHERE nonce = $1 AND used_at IS NULL AND expires_at > now()
+  RETURNING nonce`,
+    [nonce]
+  );
+  return res.rowCount === 1;
+}
+
+/** Every market removed from the app on this chain. */
+export async function selectDeletedMarkets(chainId: number): Promise<bigint[]> {
+  const res = await getPool().query<{ question_id: string }>(
+    `SELECT question_id
+       FROM market_admin_flags
+      WHERE chain_id = $1 AND deleted
+      ORDER BY question_id`,
+    [chainId]
+  );
+  return res.rows.map((r) => toBigInt(r.question_id));
+}
+
+/** `(chain_id, question_id, deleted, reason, updated_by)` — updated_at defaults to now(). */
+const FLAG_SHAPE = ['?::bigint', '?::bigint', '?::boolean', '?', '?'];
+
+/** `(chain_id, question_id, deleted, actor, reason, nonce, sig_digest)`. */
+const AUDIT_SHAPE = ['?::bigint', '?::bigint', '?::boolean', '?', '?', '?', '?'];
+
+/**
+ * Set the deleted flag for a batch of markets and record the transition.
+ *
+ * Both writes share the caller's transaction on purpose: an audit row without a
+ * flag change would be a lie, and a flag change without an audit row would be
+ * unattributable. Either both land or neither does.
+ *
+ * Returns the number of flag rows written.
+ */
+export async function setMarketDeleted(
+  c: PoolClient,
+  args: {
+    chainId: number;
+    questionIds: readonly bigint[];
+    deleted: boolean;
+    reason: string | null;
+    actor: string;
+    nonce: string;
+    sigDigest: string;
+  }
+): Promise<number> {
+  if (args.questionIds.length === 0) return 0;
+
+  let written = 0;
+  const flagBatches = chunkRows(args.questionIds, rowsPerStatement(FLAG_SHAPE.length));
+  for (const batch of flagBatches) {
+    const params: unknown[] = [];
+    for (const id of batch) {
+      params.push(args.chainId, id.toString(), args.deleted, args.reason, args.actor);
+    }
+    const res = await c.query(
+      `INSERT INTO market_admin_flags (chain_id, question_id, deleted, reason, updated_by)
+            VALUES ${valuesClause(batch.length, FLAG_SHAPE)}
+       ON CONFLICT (chain_id, question_id) DO UPDATE
+              SET deleted = EXCLUDED.deleted,
+                  reason = EXCLUDED.reason,
+                  updated_by = EXCLUDED.updated_by,
+                  updated_at = now()`,
+      params
+    );
+    written += res.rowCount ?? 0;
+  }
+
+  const auditBatches = chunkRows(args.questionIds, rowsPerStatement(AUDIT_SHAPE.length));
+  for (const batch of auditBatches) {
+    const params: unknown[] = [];
+    for (const id of batch) {
+      params.push(
+        args.chainId,
+        id.toString(),
+        args.deleted,
+        args.actor,
+        args.reason,
+        args.nonce,
+        args.sigDigest
+      );
+    }
+    await c.query(
+      `INSERT INTO market_admin_audit
+              (chain_id, question_id, deleted, actor, reason, nonce, sig_digest)
+            VALUES ${valuesClause(batch.length, AUDIT_SHAPE)}`,
+      params
+    );
+  }
+
+  return written;
+}
