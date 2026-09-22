@@ -2,8 +2,11 @@
 
 import { useCallback, useMemo } from 'react';
 import Link from 'next/link';
+import { useChainId } from 'wagmi';
 import { MarketAvatar, Badge, EmptyState, Skeleton } from '@/components/ui';
 import { StaleNotice } from '@/components/StaleNotice';
+import { RedeemButton } from '@/components/RedeemButton';
+import { getDeployment } from '@/lib/contracts';
 import { useMarketsData, useWalletPositions } from '@/hooks/useChainData';
 import { useMarketPools } from '@/hooks/useMarketPools';
 import { useMarketMetadataBatch } from '@/hooks/useMarketMetadata';
@@ -13,7 +16,7 @@ import { formatProbPct } from '@/lib/pricing';
 import { parseQuestion } from '@/lib/eventGroups';
 import { formatResolutionDate } from '@/lib/time';
 import { redeemableAmount } from '@/lib/redeemable';
-import { useHiddenMarkets } from '@/hooks/useMarketImage';
+import { useDeletedMarkets } from '@/hooks/useDeletedMarkets';
 
 const ZERO = BigInt(0);
 
@@ -34,18 +37,23 @@ const ZERO = BigInt(0);
  * as complete as the scan. So this panel leads, and the ledger-derived numbers
  * follow with their own caveats.
  *
- * Hidden markets are filtered here for the same reason they are filtered on `/`
- * and on a market page: `lib/hiddenMarkets.ts` is a presentation filter, so it
- * only works where it is actually applied, and a browsable list of positions is
- * one of those places. A holder can still reach the market by direct URL and
- * redeem — nothing here affects what is tradable.
+ * Removed markets are NOT filtered out here, unlike every browsable market list.
+ * A wallet's holdings are its own money: curation decides what the app lists, not
+ * what a holder is owed. Removed markets are badged instead, and their positions
+ * still count toward the redeemable total. See the comment on `positions`.
  */
 export function PortfolioPanel({ address }: { address: `0x${string}` }) {
+  const chainId = useChainId();
+  const deployment = getDeployment(chainId);
+  const conditionalTokens = deployment?.conditionalTokens as `0x${string}` | undefined;
+  const collateralToken = deployment?.collateralToken as `0x${string}` | undefined;
   const { markets, isLoading, stale: marketsStale, refresh: refreshMarkets } = useMarketsData();
   const { poolFor, stale: poolsStale, refetch: refreshPools } = useMarketPools(markets);
   // Shared on-chain images, so position rows match the cards elsewhere.
   const metadata = useMarketMetadataBatch(markets.map((m) => m.questionId));
-  const hidden = useHiddenMarkets();
+  // Used ONLY to badge a row 'Removed'. Never to filter positions -- see the
+  // comment on `positions` below: curation must not hide money a wallet is owed.
+  const { deleted: hidden } = useDeletedMarkets();
 
   /*
    * Every YES/NO balance in ONE request.
@@ -78,6 +86,22 @@ export function PortfolioPanel({ address }: { address: `0x${string}` }) {
     return map;
   }, [markets]);
 
+  /*
+   * EVERY position the wallet holds -- deliberately NOT filtered by curation.
+   *
+   * This used to end with `.filter((p) => !hidden.has(...))`, which quietly made
+   * a presentation filter decide how much money the page said you could
+   * withdraw: hiding a market removed its position from the rows AND from the
+   * redeemable total, so a wallet with a winning resolved position could be
+   * shown "Redeemable now $0.00". Once deletion becomes global that would get
+   * far worse -- an admin removing a market would zero out every holder's
+   * redeemable balance while their shares sat redeemable on-chain.
+   *
+   * A browsable market list is a place to apply curation. A wallet's own
+   * holdings are not: the factory has no delete, the shares exist, and the money
+   * is owed. Removed markets are badged instead, and `/`, the outcome selector,
+   * the featured rail and the leaderboard keep filtering as before.
+   */
   const positions = useMemo(
     () =>
       heldPositions
@@ -87,9 +111,8 @@ export function PortfolioPanel({ address }: { address: `0x${string}` }) {
         })
         .filter(
           (p): p is { market: (typeof markets)[number]; yes: bigint; no: bigint } => p !== null
-        )
-        .filter((p) => !hidden.has(p.market.questionId.toString())),
-    [heldPositions, marketById, hidden]
+        ),
+    [heldPositions, marketById]
   );
 
   /*
@@ -232,10 +255,13 @@ export function PortfolioPanel({ address }: { address: `0x${string}` }) {
                 ? `${parsed.eventTitle}: ${parsed.outcomeLabel}`
                 : parsed.outcomeLabel || 'Untitled market';
               return (
-                <li key={market.questionId.toString()}>
+                <li
+                  key={market.questionId.toString()}
+                  className="rounded-card border border-edge bg-surface-raised transition-colors hover:border-edge-strong"
+                >
                   <Link
                     href={`/market/${market.questionId.toString()}`}
-                    className="flex items-start gap-3 rounded-card border border-edge bg-surface-raised p-3 transition-colors hover:border-edge-strong"
+                    className="flex items-start gap-3 p-3"
                   >
                     <MarketAvatar
                       questionId={market.questionId}
@@ -267,27 +293,60 @@ export function PortfolioPanel({ address }: { address: `0x${string}` }) {
                         </span>
                       </div>
                     </div>
-                    {(() => {
-                      // "Redeemable" must mean money is actually waiting. A
-                      // resolved market where this wallet held the losing side
-                      // pays zero, and labelling that Redeemable sends people to
-                      // a button that reverts with NoWinningShares.
-                      if (!market.resolved) return <Badge tone="neutral">Open</Badge>;
-                      const payout = payoutFor(market.conditionId);
-                      if (!payout) return <Badge tone="neutral">Resolved</Badge>;
-                      const amount = redeemableAmount({
-                        yes,
-                        no,
-                        numerators: payout.numerators,
-                        denominator: payout.denominator,
-                      });
-                      return amount > ZERO ? (
-                        <Badge tone="brand">Redeemable</Badge>
-                      ) : (
-                        <Badge tone="neutral">No payout</Badge>
-                      );
-                    })()}
+                    <div className="flex flex-col items-end gap-1">
+                      {(() => {
+                        // "Redeemable" must mean money is actually waiting. A
+                        // resolved market where this wallet held the losing side
+                        // pays zero, and labelling that Redeemable sends people to
+                        // a button that reverts with NoWinningShares.
+                        if (!market.resolved) return <Badge tone="neutral">Open</Badge>;
+                        const payout = payoutFor(market.conditionId);
+                        if (!payout) return <Badge tone="neutral">Resolved</Badge>;
+                        const amount = redeemableAmount({
+                          yes,
+                          no,
+                          numerators: payout.numerators,
+                          denominator: payout.denominator,
+                        });
+                        return amount > ZERO ? (
+                          <Badge tone="brand">Redeemable</Badge>
+                        ) : (
+                          <Badge tone="neutral">No payout</Badge>
+                        );
+                      })()}
+                      {/*
+                        Removed from the browsable lists, but still held and still
+                        redeemable. Badged rather than filtered out: hiding a
+                        position would hide money the wallet is owed.
+                      */}
+                      {hidden.has(market.questionId.toString()) && (
+                        <Badge tone="warn">Removed</Badge>
+                      )}
+                    </div>
                   </Link>
+
+                  {/*
+                    Redeem lives HERE, not only on the market page. This is where
+                    people look for money they are owed, and it is the reason the
+                    button is a shared component: one definition of when it may be
+                    enabled, used by both surfaces. Outside the <Link> so a click
+                    on it does not navigate away mid-transaction.
+                  */}
+                  {market.resolved && (
+                    <div className="border-t border-edge px-3 py-2">
+                      <RedeemButton
+                        compact
+                        yesShares={yes}
+                        noShares={no}
+                        payout={payoutFor(market.conditionId)}
+                        payoutLoading={payoutsLoading}
+                        conditionalTokens={conditionalTokens}
+                        collateralToken={collateralToken}
+                        conditionId={market.conditionId as `0x${string}` | undefined}
+                        onRedeemed={refreshAll}
+                      />
+                    </div>
+                  )}
                 </li>
               );
             })}
