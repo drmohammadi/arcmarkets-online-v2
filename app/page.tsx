@@ -9,7 +9,7 @@ import { MarketToolbar, type SortKey, type StatusKey } from '@/components/Market
 import { EmptyState, Skeleton } from '@/components/ui';
 import { useMarkets } from '@/hooks/useMarkets';
 import { useMarketPools } from '@/hooks/useMarketPools';
-import { useHiddenMarkets } from '@/hooks/useMarketImage';
+import { useDeletedMarkets } from '@/hooks/useDeletedMarkets';
 import { useMarketMetadataBatch } from '@/hooks/useMarketMetadata';
 import { groupMarkets, type EventGroup } from '@/lib/eventGroups';
 import { CATEGORIES, type CategoryKey } from '@/lib/marketMeta';
@@ -18,7 +18,8 @@ export default function HomePage() {
   const { isConnected } = useAccount();
   const { markets, isLoading } = useMarkets();
   const { poolFor, isLoading: poolsLoading } = useMarketPools(markets);
-  const hidden = useHiddenMarkets();
+  // Server-authoritative removals, shared by every visitor (was localStorage).
+  const { deleted: hidden } = useDeletedMarkets();
   // One batched read for every card's on-chain image URL. Without this the
   // cards only see per-browser localStorage uploads and render the monogram for
   // every market whose image lives in the metadata registry.
@@ -41,7 +42,7 @@ export default function HomePage() {
 
   // Hidden markets are dropped before grouping, so a hidden outcome also stops
   // contributing to its event's card, counts and featured ranking. Hiding is a
-  // presentation filter only — see lib/hiddenMarkets.ts.
+  // presentation filter only — the market stays on-chain and reachable by URL.
   const visibleMarkets = useMemo(
     () => (hidden.size === 0 ? markets : markets.filter((m) => !hidden.has(m.questionId.toString()))),
     [markets, hidden]
