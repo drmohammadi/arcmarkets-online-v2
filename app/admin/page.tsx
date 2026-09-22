@@ -15,12 +15,12 @@ import { LiquidityForm } from '@/components/LiquidityForm';
 import { MarketMetadataForm } from '@/components/MarketMetadataForm';
 import { Badge, EmptyState, ErrorNote } from '@/components/ui';
 import { useMarkets } from '@/hooks/useMarkets';
-import { useHiddenMarkets } from '@/hooks/useMarketImage';
+import { useDeletedMarkets } from '@/hooks/useDeletedMarkets';
+import { useAdminFlagWrite } from '@/hooks/useAdminFlagWrite';
 import { getDeployment, getMetadataAddress } from '@/lib/contracts';
 import { marketFactoryAbi, marketMetadataAbi, erc20Abi } from '@/lib/abis';
 import { sanitizeText, safeAddress } from '@/lib/sanitize';
 import { safeImageUrl } from '@/lib/links';
-import { hideMarket, unhideMarket } from '@/lib/hiddenMarkets';
 import { parseQuestion } from '@/lib/eventGroups';
 import { resolveBlocker, type ResolveBlocker } from '@/lib/resolveEligibility';
 import {
@@ -79,8 +79,30 @@ export default function AdminPage() {
   const paused = factoryPaused === true;
 
   const { markets } = useMarkets();
-  const hidden = useHiddenMarkets();
+  const { deleted: deletedMarkets, refresh: refreshDeleted } = useDeletedMarkets();
+  const flagWrite = useAdminFlagWrite();
   const { writeContractAsync } = useWriteContract();
+
+  /**
+   * Remove a market from the app for everyone (or restore it), through a signed
+   * request. Not on-chain — see hooks/useAdminFlagWrite and the write route.
+   * Surfaces the write hook's error into the page banner.
+   */
+  const handleSetDeleted = useCallback(
+    async (questionId: bigint, next: boolean): Promise<boolean> => {
+      setError('');
+      setNotice('');
+      const ok = await flagWrite.setDeleted([questionId], next);
+      if (ok) {
+        setNotice(next ? `Market #${questionId.toString()} removed.` : `Market #${questionId.toString()} restored.`);
+        refreshDeleted();
+      } else if (flagWrite.error) {
+        setError(flagWrite.error);
+      }
+      return ok;
+    },
+    [flagWrite, refreshDeleted]
+  );
 
   // Form state
   const [multi, setMulti] = useState(false);
@@ -769,8 +791,9 @@ export default function AdminPage() {
                   resolver={m.resolver}
                   connected={address}
                   paused={paused}
-                  hidden={hidden.has(m.questionId.toString())}
-                  chainId={chainId}
+                  deleted={deletedMarkets.has(m.questionId.toString())}
+                  flagBusy={flagWrite.busy}
+                  onSetDeleted={handleSetDeleted}
                   collateralToken={deployment?.collateralToken}
                   busy={busy}
                   onResolve={handleResolve}
@@ -948,8 +971,9 @@ function MarketRow({
   resolver,
   connected,
   paused,
-  hidden,
-  chainId,
+  deleted,
+  flagBusy,
+  onSetDeleted,
   collateralToken,
   busy,
   onResolve,
@@ -962,8 +986,9 @@ function MarketRow({
   resolver: string;
   connected: string | undefined;
   paused: boolean;
-  hidden: boolean;
-  chainId: number;
+  deleted: boolean;
+  flagBusy: boolean;
+  onSetDeleted: (questionId: bigint, deleted: boolean) => Promise<boolean>;
   collateralToken: string | undefined;
   busy: boolean;
   onResolve: (questionId: bigint, yesWins: boolean) => void;
@@ -1010,7 +1035,7 @@ function MarketRow({
           <Badge tone="neutral">Open</Badge>
         )}
         {parsed.eventTitle && <Badge tone="neutral">Event outcome</Badge>}
-        {hidden && <Badge tone="warn">Hidden</Badge>}
+        {deleted && <Badge tone="warn">Removed</Badge>}
       </div>
 
       <p className="mb-3 text-sm font-medium leading-snug text-content">{title}</p>
@@ -1044,37 +1069,48 @@ function MarketRow({
         )}
 
         {/*
-         * "Hide", not "Delete". MarketFactory has no delete or archive function
-         * and markets are enumerated 0..nextQuestionId, so removal would mean
-         * redeploying the factory — abandoning every existing market and every
-         * open position. Hiding filters the browsable list only; the market,
-         * its pool and all positions stay on-chain and reachable by URL, so
-         * holders can always still redeem. See lib/hiddenMarkets.ts.
+         * DELETE, not hide-in-this-browser.
+         *
+         * This used to write localStorage (the old lib/hiddenMarkets.ts), so a
+         * removal applied only to the admin's own browser and clearing site data
+         * undid it. It now signs a request to `/api/admin/markets/flags`, which
+         * recovers the signer server-side and compares it to a live
+         * `MarketFactory.owner()` read before writing `market_admin_flags`.
+         * Every visitor sees the result.
+         *
+         * Still not an on-chain delete: `MarketFactory` has no such function and
+         * markets are enumerated 0..nextQuestionId. The market, its pool and all
+         * positions remain on-chain and reachable by direct URL, and a holder's
+         * redeemable balance is deliberately NOT filtered by this flag.
          */}
-        {hidden ? (
+        {deleted ? (
           <button
             type="button"
-            onClick={() => unhideMarket(chainId, questionId)}
-            className="h-9 rounded-lg border border-edge px-3 text-xs font-medium text-content transition-colors hover:border-edge-strong"
+            onClick={() => onSetDeleted(questionId, false)}
+            disabled={flagBusy}
+            className="h-9 rounded-lg border border-edge px-3 text-xs font-medium text-content transition-colors hover:border-edge-strong disabled:opacity-40"
           >
-            Unhide
+            {flagBusy ? 'Working…' : 'Restore'}
           </button>
         ) : confirmingHide ? (
           <span className="flex items-center gap-2">
             <button
               type="button"
               onClick={() => {
-                hideMarket(chainId, questionId);
-                setConfirmingHide(false);
+                void onSetDeleted(questionId, true).then((ok) => {
+                  if (ok) setConfirmingHide(false);
+                });
               }}
-              className="h-9 rounded-lg bg-no px-3 text-xs font-semibold text-white transition-opacity hover:opacity-90"
+              disabled={flagBusy}
+              className="h-9 rounded-lg bg-no px-3 text-xs font-semibold text-white transition-opacity hover:opacity-90 disabled:opacity-40"
             >
-              Confirm hide
+              {flagBusy ? 'Signing…' : 'Confirm delete'}
             </button>
             <button
               type="button"
               onClick={() => setConfirmingHide(false)}
-              className="h-9 rounded-lg border border-edge px-3 text-xs font-medium text-content-muted transition-colors hover:text-content"
+              disabled={flagBusy}
+              className="h-9 rounded-lg border border-edge px-3 text-xs font-medium text-content-muted transition-colors hover:text-content disabled:opacity-40"
             >
               Cancel
             </button>
@@ -1083,10 +1119,10 @@ function MarketRow({
           <button
             type="button"
             onClick={() => setConfirmingHide(true)}
-            title="Removes this market from the browsable list in this browser. Nothing on-chain changes."
+            title="Removes this market from the app for everyone. Requires a wallet signature. Nothing on-chain changes."
             className="h-9 rounded-lg border border-edge px-3 text-xs font-medium text-content-muted transition-colors hover:border-edge-strong hover:text-content"
           >
-            Hide from list
+            Delete market
           </button>
         )}
       </div>
@@ -1107,10 +1143,12 @@ function MarketRow({
         </p>
       )}
 
-      {confirmingHide && !hidden && (
+      {confirmingHide && !deleted && (
         <p className="mt-2 text-2xs leading-relaxed text-content-muted">
-          This only hides the market from the list in this browser. The market, its liquidity and
-          every position remain on-chain, and holders can still open it directly to redeem.
+          This removes the market from the app for <strong>everyone</strong>, on every device. You
+          will be asked to sign a message to prove you own the factory; it costs no gas and nothing
+          on-chain changes. The market, its liquidity and every position remain on-chain, holders
+          can still open it directly to redeem, and their redeemable balance is unaffected.
         </p>
       )}
 
