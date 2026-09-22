@@ -3,7 +3,6 @@
 import { useEffect, useState } from 'react';
 import { useChainId } from 'wagmi';
 import { getMarketImage, IMAGE_CHANGE_EVENT } from '@/lib/marketImages';
-import { getHiddenMarkets, HIDDEN_CHANGE_EVENT } from '@/lib/hiddenMarkets';
 
 /**
  * The stored image for one market, kept in sync with uploads.
@@ -37,30 +36,4 @@ export function useMarketImage(questionId: bigint | null): string | null {
   }, [chainId, questionId]);
 
   return src;
-}
-
-/**
- * The set of hidden questionIds, as decimal strings.
- *
- * Same mount-then-read pattern, for the same hydration reason. Returns an empty
- * set on the server and on first paint, so nothing is hidden until the client
- * has actually read storage.
- */
-export function useHiddenMarkets(): Set<string> {
-  const chainId = useChainId();
-  const [hidden, setHidden] = useState<Set<string>>(() => new Set());
-
-  useEffect(() => {
-    const read = () => setHidden(getHiddenMarkets(chainId));
-    read();
-
-    window.addEventListener(HIDDEN_CHANGE_EVENT, read);
-    window.addEventListener('storage', read);
-    return () => {
-      window.removeEventListener(HIDDEN_CHANGE_EVENT, read);
-      window.removeEventListener('storage', read);
-    };
-  }, [chainId]);
-
-  return hidden;
 }
