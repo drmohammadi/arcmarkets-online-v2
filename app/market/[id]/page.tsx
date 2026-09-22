@@ -3,22 +3,21 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useParams, useSearchParams } from 'next/navigation';
-import { useWriteContract, useWaitForTransactionReceipt } from 'wagmi';
 import { Header } from '@/components/Header';
 import { PriceChart } from '@/components/PriceChart';
 import { TradePanel } from '@/components/TradePanel';
 import { Comments } from '@/components/Comments';
-import { MarketIcon, Badge, ProbabilityBar, EmptyState, Skeleton, ErrorNote } from '@/components/ui';
+import { MarketIcon, Badge, ProbabilityBar, EmptyState, Skeleton } from '@/components/ui';
 import { useMarket } from '@/hooks/useMarket';
 import { useMarkets } from '@/hooks/useMarkets';
 import { useMarketPools } from '@/hooks/useMarketPools';
 import { usePosition } from '@/hooks/usePosition';
 import { useMarketPayouts } from '@/hooks/useMarketPayouts';
 import { useTradeHistory } from '@/hooks/useTradeHistory';
-import { useMarketImage, useHiddenMarkets } from '@/hooks/useMarketImage';
+import { useMarketImage } from '@/hooks/useMarketImage';
+import { useDeletedMarkets } from '@/hooks/useDeletedMarkets';
 import { useMarketMetadata } from '@/hooks/useMarketMetadata';
-import { conditionalTokensAbi } from '@/lib/abis';
-import { redeemableAmount } from '@/lib/redeemable';
+import { RedeemButton } from '@/components/RedeemButton';
 import type { PayoutInfo } from '@/lib/ledger';
 import { sanitizeText, shortAddress } from '@/lib/sanitize';
 import { formatUsdc, formatUsdcCompact } from '@/lib/format';
@@ -85,7 +84,7 @@ export default function MarketPage() {
    * This page previously grouped the RAW market list, so a deleted outcome stayed
    * in the Outcomes list here even though the home page and its event card had
    * already dropped it — the deletion looked like it had only half applied.
-   * `useHiddenMarkets` is the same source the home page filters on and it
+   * `useDeletedMarkets` is the same source the home page filters on and it
    * re-reads on the change event, so a removal takes effect immediately, in this
    * tab, without a reload.
    *
@@ -94,10 +93,10 @@ export default function MarketPage() {
    * the group's own entry. The page itself keeps working: everything it renders
    * comes from `useMarket`, not from the group, so a direct link to a removed
    * market still shows its price, position and Redeem button. That matters —
-   * `MarketFactory` has no delete (see lib/hiddenMarkets.ts), so the market and
+   * `MarketFactory` has no delete, so the market and
    * any shares outstanding against it are still very much on-chain.
    */
-  const hidden = useHiddenMarkets();
+  const { deleted: hidden } = useDeletedMarkets();
   const visibleMarkets = useMemo(
     () =>
       hidden.size === 0
@@ -538,58 +537,7 @@ function PositionCard({
   conditionId: `0x${string}` | undefined;
   onRedeemed: () => void;
 }) {
-  const [error, setError] = useState('');
-  const { writeContract, data: txHash, isPending } = useWriteContract();
-  const { isLoading: waiting, isSuccess } = useWaitForTransactionReceipt({ hash: txHash });
-  const working = isPending || waiting;
-
-  useEffect(() => {
-    if (isSuccess) onRedeemed();
-  }, [isSuccess, onRedeemed]);
-
   if (yesShares <= BigInt(0) && noShares <= BigInt(0)) return null;
-
-  /*
-   * What `redeemPositions` would actually pay this wallet, from the reported
-   * numerators -- zero for a losing position. Computed after the no-shares early
-   * return and before any branch that offers the button, so the button and the
-   * amount can never describe different things.
-   */
-  const redeemable =
-    payout === null
-      ? BigInt(0)
-      : redeemableAmount({
-          yes: yesShares,
-          no: noShares,
-          numerators: payout.numerators,
-          denominator: payout.denominator,
-        });
-
-  function handleRedeem() {
-    if (!conditionalTokens || !collateralToken || !conditionId) {
-      setError('Market data is still loading. Try again in a moment.');
-      return;
-    }
-    setError('');
-    writeContract(
-      {
-        address: conditionalTokens,
-        abi: conditionalTokensAbi,
-        functionName: 'redeemPositions',
-        args: [collateralToken, conditionId],
-      },
-      {
-        onError: (err) => {
-          const msg = err instanceof Error ? err.message : String(err);
-          setError(
-            msg.toLowerCase().includes('nowinningshares')
-              ? 'No winning shares to redeem in this market.'
-              : sanitizeText(msg).slice(0, 200) || 'Redeem failed'
-          );
-        },
-      }
-    );
-  }
 
   return (
     <section className="rounded-card border border-edge bg-surface-raised p-4">
@@ -607,48 +555,17 @@ function PositionCard({
         )}
       </div>
 
-      {resolved &&
-        (payout === null ? (
-          /*
-           * Resolved, but the numerators have not arrived. Offering the button
-           * here would be a guess; suppressing the card entirely would hide a
-           * real payout. Say which it is instead.
-           */
-          <p className="mt-3 text-xs text-content-muted" role="status">
-            {payoutLoading
-              ? 'Checking what this position pays…'
-              : 'Payout data for this market could not be loaded, so the redeemable amount is unknown. Reload to try again.'}
-          </p>
-        ) : redeemable > BigInt(0) ? (
-          <>
-            <button
-              type="button"
-              onClick={handleRedeem}
-              disabled={working}
-              className="mt-3 h-9 rounded-lg bg-brand px-4 text-xs font-semibold text-white transition-colors hover:bg-brand-hover disabled:opacity-50"
-            >
-              {working ? 'Redeeming…' : `Redeem $${formatUsdc(redeemable)}`}
-            </button>
-            <p className="mt-1.5 text-2xs text-content-subtle">
-              Exact amount from the reported payouts, not an estimate.
-            </p>
-          </>
-        ) : (
-          /*
-           * Resolved and worth nothing. The button used to render here and
-           * revert with NoWinningShares on click -- the user learned the outcome
-           * from a failed transaction. `redeemPositions` reverts when the payout
-           * is zero (ConditionalTokens.sol:137), so there is nothing to offer.
-           */
-          <p className="mt-3 text-xs text-content-muted">
-            This market resolved against your position, so there is nothing to redeem.
-          </p>
-        ))}
-
-      {error && (
-        <div className="mt-3">
-          <ErrorNote message={error} />
-        </div>
+      {resolved && (
+        <RedeemButton
+          yesShares={yesShares}
+          noShares={noShares}
+          payout={payout}
+          payoutLoading={payoutLoading}
+          conditionalTokens={conditionalTokens}
+          collateralToken={collateralToken}
+          conditionId={conditionId}
+          onRedeemed={onRedeemed}
+        />
       )}
     </section>
   );
