@@ -40,7 +40,10 @@ export function ProfileView({ address }: { address: `0x${string}` }) {
   const { address: connected } = useAccount();
   const isOwnProfile = !!connected && connected.toLowerCase() === address.toLowerCase();
 
-  const stats = useTradeStats();
+  // Pass the address so the ledger can reconcile derived shares against real
+  // balances -- redemption emits no Buy/Sell, so without this a cashed-out
+  // winning position shows Realized $0 and a permanently "open" gain.
+  const stats = useTradeStats(address);
   const username = useUsername(address);
   const trades = stats.tradesFor(address);
   const totals = stats.statsFor(address);
