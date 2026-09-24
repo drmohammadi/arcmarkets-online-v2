@@ -127,6 +127,8 @@ export default function AdminPage() {
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
+  /** Free-text filter for the manage list. */
+  const [marketQuery, setMarketQuery] = useState('');
   /** "Creating 2 of 3…" during a multi-outcome run. */
   const [progress, setProgress] = useState('');
 
@@ -480,6 +482,31 @@ export default function AdminPage() {
     [markets]
   );
 
+  /**
+   * Filter the manage list by question text, outcome label, event title, category,
+   * questionId or FPMM address.
+   *
+   * Matching is done on the SANITIZED question, the same string the row renders,
+   * so what an admin sees is what they can search for. Ids and addresses are
+   * included because a market reported in a bug report or a block explorer is
+   * identified by those rather than by its title.
+   */
+  const visibleMarkets = useMemo(() => {
+    const q = marketQuery.trim().toLowerCase();
+    if (q === '') return sortedMarkets;
+    return sortedMarkets.filter((m) => {
+      const question = sanitizeText(m.question).toLowerCase();
+      if (question.includes(q)) return true;
+      const parsed = parseQuestion(m.question);
+      if (parsed.eventTitle && parsed.eventTitle.toLowerCase().includes(q)) return true;
+      if (parsed.outcomeLabel.toLowerCase().includes(q)) return true;
+      if (sanitizeText(m.category).toLowerCase().includes(q)) return true;
+      if (m.questionId.toString().includes(q)) return true;
+      if (m.fpmm.toLowerCase().includes(q)) return true;
+      return false;
+    });
+  }, [sortedMarkets, marketQuery]);
+
   if (!isOwner) {
     return (
       <main className="flex-1">
@@ -772,15 +799,37 @@ export default function AdminPage() {
           <h2 className="mb-3 text-sm font-semibold text-content">
             Manage markets
             <span className="ml-1.5 font-normal tabular-nums text-content-subtle">
-              {markets.length}
+              {marketQuery.trim() === ''
+                ? markets.length
+                : `${visibleMarkets.length} / ${markets.length}`}
             </span>
           </h2>
 
+          {markets.length > 0 && (
+            <div className="mb-3">
+              <label className="block">
+                <span className="sr-only">Search markets</span>
+                <input
+                  type="search"
+                  value={marketQuery}
+                  onChange={(e) => setMarketQuery(e.target.value)}
+                  placeholder="Search by question, outcome, category, id or pool address"
+                  className="h-9 w-full rounded-lg border border-edge bg-surface px-3 text-xs text-content placeholder:text-content-subtle focus:border-edge-strong focus:outline-none focus-visible:ring-2 focus-visible:ring-brand"
+                />
+              </label>
+            </div>
+          )}
+
           {markets.length === 0 ? (
             <EmptyState title="No markets yet" hint="Create one above to get started." />
+          ) : visibleMarkets.length === 0 ? (
+            <EmptyState
+              title="No markets match that search"
+              hint="Try part of the question, an outcome label, a category, a questionId or a pool address."
+            />
           ) : (
             <ul className="space-y-3">
-              {sortedMarkets.map((m) => (
+              {visibleMarkets.map((m) => (
                 <MarketRow
                   key={m.questionId.toString()}
                   questionId={m.questionId}
