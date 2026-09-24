@@ -219,33 +219,105 @@ export function lotPnl(
     reserveYes?: bigint;
     reserveNo?: bigint;
     hasLiquidity?: boolean;
+    /**
+     * The wallet's ACTUAL on-chain balance of this outcome, when known.
+     *
+     * WHY THIS EXISTS. `lot.shares` is derived from Buy/Sell events alone, and
+     * redemption is neither: `ConditionalTokens.redeemPositions` burns the
+     * shares and emits `PositionRedeemed`, which nothing in this app indexes.
+     * So after a holder redeems a won market, the ledger still believes they
+     * hold the position — `realized` stays 0 (the normal exit for a resolved
+     * market never touches it) and the settled gain sits in `open` forever, as
+     * though the money were still at risk when it is already in their wallet.
+     *
+     * Balances are exact and cost one batched read; derived shares are only as
+     * complete as the log sweep. So when a balance is supplied and it is LOWER
+     * than the derived figure, the difference has left the position, and its
+     * settled value is moved from `open` into `realized`.
+     *
+     * Omitted for the leaderboard, which would need every trader's balances.
+     * Absent means "do not reconcile", NOT "balance is zero".
+     */
+    actualShares?: bigint;
   }
 ): LotPnl {
   const base = { realized: lot.realized, open: ZERO, total: lot.realized, marked: true };
 
   if (lot.shares <= ZERO) return base;
 
+  /*
+   * Split the position into the part that has LEFT (redeemed or transferred out)
+   * and the part still held, before valuing either.
+   *
+   * Only a shortfall is acted on. A balance HIGHER than the derived figure means
+   * shares arrived from outside the scanned window or by direct transfer, which
+   * says nothing about this position's cost basis — `basisIncomplete` already
+   * covers that case, and inventing basis for them would fabricate PnL.
+   */
+  const known = opts.actualShares;
+  const gone =
+    known !== undefined && known >= ZERO && known < lot.shares ? lot.shares - known : ZERO;
+  const heldShares = lot.shares - gone;
+
+  // Multiply BEFORE dividing (rule 1): cost < shares for every position here, so
+  // the other order truncates to zero and would report the exit as pure profit.
+  // An exact full exit removes the WHOLE basis (rule 4), leaving no dust.
+  const goneBasis =
+    gone === ZERO ? ZERO : gone === lot.shares ? lot.cost : (lot.cost * gone) / lot.shares;
+  const heldCost = lot.cost - goneBasis;
+
+  /** Value of the departed shares. Unresolved: assume they left at cost, so no
+   *  PnL is invented for a transfer we cannot price. Resolved: the real payout. */
+  let goneRealized = ZERO;
+  /**
+   * Whether the departed shares could actually be valued.
+   *
+   * False only when the market HAS resolved but its payout is unreadable: the
+   * shares are gone and worth something we cannot determine, so reporting a
+   * settled figure would be a fabrication. An unresolved transfer is fine —
+   * leaving at cost is a deliberate, stated choice rather than a failed read.
+   */
+  let goneValued = true;
+  if (gone > ZERO && opts.resolved) {
+    const p = opts.payout;
+    if (p && p.denominator > ZERO) {
+      const goneValue = (gone * p.numerators[lot.outcome]) / p.denominator;
+      goneRealized = goneValue - goneBasis;
+    } else {
+      goneValued = false;
+    }
+  }
+
+  const realized = lot.realized + goneRealized;
+
+  // Nothing left at risk: everything is settled. `marked` still reflects whether
+  // the departed shares could be priced -- a fully exited position whose payout
+  // never loaded must not present its 0 as a known result.
+  if (heldShares <= ZERO) {
+    return { realized, open: ZERO, total: realized, marked: goneValued };
+  }
+
   if (opts.resolved) {
     const p = opts.payout;
     if (!p || p.denominator <= ZERO) {
       // Cannot value the position honestly; report only what is locked in.
-      return { ...base, marked: false };
+      return { realized, open: ZERO, total: realized, marked: false };
     }
-    const value = (lot.shares * p.numerators[lot.outcome]) / p.denominator;
-    const open = value - lot.cost;
-    return { realized: lot.realized, open, total: lot.realized + open, marked: true };
+    const value = (heldShares * p.numerators[lot.outcome]) / p.denominator;
+    const open = value - heldCost;
+    return { realized, open, total: realized + open, marked: goneValued };
   }
 
   if (!opts.hasLiquidity || opts.reserveYes === undefined || opts.reserveNo === undefined) {
     // An empty pool prices at a neutral 50/50 placeholder. Marking against a
     // fabricated price is worse than declining to mark.
-    return { ...base, marked: false };
+    return { realized, open: ZERO, total: realized, marked: false };
   }
 
   const bps = outcomeProbBps(opts.reserveYes, opts.reserveNo, lot.outcome);
-  const value = (lot.shares * BigInt(bps)) / BigInt(BPS);
-  const open = value - lot.cost;
-  return { realized: lot.realized, open, total: lot.realized + open, marked: true };
+  const value = (heldShares * BigInt(bps)) / BigInt(BPS);
+  const open = value - heldCost;
+  return { realized, open, total: realized + open, marked: goneValued };
 }
 
 /**
