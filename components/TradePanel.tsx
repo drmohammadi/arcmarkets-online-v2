@@ -18,6 +18,8 @@ import {
   maxSharesIn,
 } from '@/lib/pricing';
 import { ErrorNote, Badge } from './ui';
+import { RedeemButton } from './RedeemButton';
+import type { PayoutInfo } from '@/lib/ledger';
 
 type Mode = 'buy' | 'sell';
 type Outcome = 0 | 1;
@@ -56,7 +58,11 @@ export function TradePanel({
   initialOutcome = 0,
   yesShares,
   noShares,
+  conditionId,
+  resolvedPayout,
+  resolvedPayoutLoading,
   onTraded,
+  onRedeemed,
 }: {
   fpmm: `0x${string}` | undefined;
   collateralToken: `0x${string}` | undefined;
@@ -67,7 +73,17 @@ export function TradePanel({
   initialOutcome?: Outcome;
   yesShares: bigint;
   noShares: bigint;
+  conditionId: `0x${string}` | undefined;
+  /**
+   * Reported payout numerators once resolved, or null while unknown. Named
+   * `resolvedPayout` rather than `payout` because this component already has a
+   * local `payout` for the potential-profit estimate on an OPEN market -- two
+   * different quantities that must not share a name.
+   */
+  resolvedPayout: PayoutInfo | null;
+  resolvedPayoutLoading: boolean;
   onTraded?: () => void;
+  onRedeemed?: () => void;
 }) {
   const { address, isConnected } = useAccount();
   const [mode, setMode] = useState<Mode>('buy');
@@ -319,14 +335,46 @@ export function TradePanel({
     }
   }
 
+  /*
+   * RESOLVED: the action area becomes Redeem.
+   *
+   * This used to be a dead-end notice pointing at the "Your position" card far
+   * below the fold, so the one thing a user could still do was the one thing the
+   * action box did not offer. The Redeem control now sits exactly where Buy/Sell
+   * normally is, using the SAME shared `RedeemButton` as the position card --
+   * there is still one redemption implementation, not two.
+   *
+   * `RedeemButton` decides its own state: an enabled button with the exact amount
+   * when there are winnings, plain text when the position lost, and a distinct
+   * message while payouts are still loading. So this branch never has to guess
+   * whether redemption is possible.
+   */
   if (resolved) {
+    const holdsShares = yesShares > BigInt(0) || noShares > BigInt(0);
     return (
       <Panel>
-        <div className="rounded-lg bg-surface-sunken px-3 py-6 text-center">
+        <div className="rounded-lg bg-surface-sunken px-3 py-5 text-center">
           <p className="text-sm font-medium text-content">Market resolved</p>
           <p className="mt-1 text-xs text-content-muted">
-            Trading is closed. Winning shares can be redeemed from your position.
+            {holdsShares
+              ? 'Trading is closed. Redeem your winning shares.'
+              : 'Trading is closed. You hold no shares in this market.'}
           </p>
+
+          {holdsShares && (
+            <div className="mt-4 flex justify-center">
+              <RedeemButton
+                yesShares={yesShares}
+                noShares={noShares}
+                payout={resolvedPayout}
+                payoutLoading={resolvedPayoutLoading}
+                conditionalTokens={conditionalTokens}
+                collateralToken={collateralToken}
+                conditionId={conditionId}
+                onRedeemed={onRedeemed}
+              />
+            </div>
+          )}
         </div>
       </Panel>
     );
