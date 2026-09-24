@@ -2,7 +2,7 @@
 
 import { useCallback, useMemo } from 'react';
 import type { Market } from './useMarkets';
-import { useMarketsData } from './useChainData';
+import { useMarketsData, useWalletPositions } from './useChainData';
 import { useMarketPools } from './useMarketPools';
 import { useMarketPayouts } from './useMarketPayouts';
 import { useTradeLedger } from './useTradeLedger';
@@ -43,7 +43,7 @@ export interface PositionRow {
   status: TradeStatus;
 }
 
-export function useTradeStats(): {
+export function useTradeStats(reconcileFor?: `0x${string}` | undefined): {
   markets: Market[];
   /** All trades in the window, newest first. */
   trades: LedgerTrade[];
@@ -71,6 +71,21 @@ export function useTradeStats(): {
   const { payoutFor } = useMarketPayouts(markets);
   const ledger = useTradeLedger(markets);
 
+  /*
+   * The wallet's REAL balances, used to reconcile the ledger's derived shares.
+   *
+   * Redemption burns shares without emitting Buy or Sell, so a redeemed position
+   * looks permanently open to the ledger and its settled gain never reaches
+   * `realized` -- which is why "Realized" read $0 for anyone who had cashed out
+   * a won market. Balances are exact and cost ONE batched read.
+   *
+   * Only available for a single address, so only the profile can reconcile; the
+   * leaderboard would need every trader's balances. Callers that pass nothing
+   * get the old derived-only behaviour, and `balanceFor` is simply not consulted.
+   */
+  const wallet = useWalletPositions(reconcileFor, markets);
+  const walletBalanceFor = wallet.balanceFor;
+
   const marketById = useMemo(() => {
     const map = new Map<string, Market>();
     for (const m of markets) map.set(m.questionId.toString(), m);
@@ -84,15 +99,21 @@ export function useTradeStats(): {
     (lot: Lot): LotPnl => {
       const market = marketById.get(lot.questionId.toString());
       const pool = poolFor(lot.questionId);
+      // Reconcile ONLY the address we actually hold balances for. Passing another
+      // trader's lot through this wallet's balances would invent an exit.
+      const reconcile =
+        reconcileFor !== undefined && lot.trader === reconcileFor.toLowerCase();
+      const held = reconcile ? walletBalanceFor(lot.questionId) : null;
       return lotPnl(lot, {
         resolved: !!market?.resolved,
         payout: payoutFor(market?.conditionId),
         reserveYes: pool.reserveYes,
         reserveNo: pool.reserveNo,
         hasLiquidity: pool.hasLiquidity,
+        actualShares: held ? (lot.outcome === 0 ? held.yes : held.no) : undefined,
       });
     },
-    [marketById, poolFor, payoutFor]
+    [marketById, poolFor, payoutFor, reconcileFor, walletBalanceFor]
   );
 
   const statusOf = useCallback(
