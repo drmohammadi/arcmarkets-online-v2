@@ -27,7 +27,10 @@ export default function HomePage() {
 
   const [query, setQuery] = useState('');
   const [category, setCategory] = useState<CategoryKey | 'all'>('all');
-  const [status, setStatus] = useState<StatusKey>('open');
+  // Defaults to 'all' so ended markets are visible on first load. It used to be
+  // 'open', which silently hid every expired-but-unresolved market behind a
+  // filter most visitors never touch.
+  const [status, setStatus] = useState<StatusKey>('all');
   const [sort, setSort] = useState<SortKey>('liquidity');
 
   // Held in state and set after mount so server and client render the same
