@@ -356,6 +356,10 @@ export default function MarketPage() {
             conditionalTokens={market.conditionalTokens}
             yesBps={yesBps}
             resolved={market.resolved}
+            conditionId={market.conditionId as `0x${string}` | undefined}
+            resolvedPayout={payout}
+            resolvedPayoutLoading={payoutLoading}
+            onRedeemed={refetchAll}
             hasLiquidity={hasLiquidity}
             initialOutcome={initialOutcome}
             yesShares={position.yesShares}
@@ -555,18 +559,12 @@ function PositionCard({
         )}
       </div>
 
-      {resolved && (
-        <RedeemButton
-          yesShares={yesShares}
-          noShares={noShares}
-          payout={payout}
-          payoutLoading={payoutLoading}
-          conditionalTokens={conditionalTokens}
-          collateralToken={collateralToken}
-          conditionId={conditionId}
-          onRedeemed={onRedeemed}
-        />
-      )}
+      {/*
+        No Redeem button here any more: the primary action moved into the trading
+        box at the top of the page, where Buy/Sell normally sits. Two buttons for
+        one action invites double submission and splits the amount display across
+        two places that could disagree.
+      */}
     </section>
   );
 }
