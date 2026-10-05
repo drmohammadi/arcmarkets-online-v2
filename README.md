@@ -78,9 +78,9 @@ Resolve
      ↓
 Redeem Winning Shares
 ```
-💰 Liquidity
+💰 **Liquidity**
 
-Markets use a Fixed Product Market Maker (FPMM).
+**Markets use a Fixed Product Market Maker (FPMM).**
 
 Liquidity providers supply the underlying outcome tokens to the market pool.
 
@@ -98,7 +98,7 @@ Conservation during split/merge
 Correct rounding
 Correct fee accounting
 
-📈 Real-Time Market Charts
+📈 **Real-Time Market Charts**
 
 Markets include price/probability charts to visualize how the market moved over time.
 
@@ -119,7 +119,7 @@ Next.js Frontend
 This significantly reduces RPC work and improves chart loading performance.
 
 
-🏗️ Architecture
+🏗️ **Architecture**
                     ┌─────────────────────┐
                     │      Next.js UI     │
                     │                     │
@@ -153,7 +153,7 @@ This significantly reduces RPC work and improves chart loading performance.
                     │ Price history       │
                     │ Market activity     │
                     └─────────────────────┘
-🔐 Smart Contracts
+🔐 **Smart Contracts**
 
 The core contracts include:
 
@@ -205,7 +205,7 @@ Comments
 User activity
 
 
-📁 Repository Structure
+📁 **Repository Structure**
 arc-prediction-market/
 │
 ├── contracts/
