@@ -242,7 +242,7 @@ User activity
 └── README.md
 ```
 ## License
-
-MIT — see LICENSE file.
-
+```
+MIT see LICENSE file.
+```
 Built by Fabio.
