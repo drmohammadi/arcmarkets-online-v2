@@ -105,7 +105,7 @@ Markets include price/probability charts to visualize how the market moved over 
 The chart system is designed to support fast historical data retrieval through a database-backed indexing layer rather than repeatedly scanning the blockchain from the frontend.
 
 Architecture:
-
+```
 Arc Blockchain
       ↓
 Indexer
@@ -115,11 +115,12 @@ Database
 Chart API
       ↓
 Next.js Frontend
-
+```
 This significantly reduces RPC work and improves chart loading performance.
 
 
 🏗️ **Architecture**
+```
                     ┌─────────────────────┐
                     │      Next.js UI     │
                     │                     │
@@ -153,6 +154,7 @@ This significantly reduces RPC work and improves chart loading performance.
                     │ Price history       │
                     │ Market activity     │
                     └─────────────────────┘
+```
 🔐 **Smart Contracts**
 
 The core contracts include:
@@ -206,6 +208,7 @@ User activity
 
 
 📁 **Repository Structure**
+```
 arc-prediction-market/
 │
 ├── contracts/
@@ -236,7 +239,7 @@ arc-prediction-market/
 │
 ├── package.json
 └── README.md
-
+```
 ## License
 
 MIT — see LICENSE file.
