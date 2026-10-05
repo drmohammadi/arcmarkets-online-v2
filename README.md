@@ -1,6 +1,6 @@
-# 0xOutcome
+# 0xOutcome On-Chain Prediction Market
 
-**0xOutcome** is a fully on-chain, Polymarket-style prediction market built on **Circle's Arc **.
+**0xOutcome** is a fully on-chain, Polymarket-style prediction market built on **Circle's Arc**.
 
 Trade YES/NO outcomes, provide liquidity, follow market probabilities, and redeem winning positions all settled on-chain with USDC.
 
@@ -78,26 +78,164 @@ Resolve
      ↓
 Redeem Winning Shares
 ```
+💰 Liquidity
+
+Markets use a Fixed Product Market Maker (FPMM).
+
+Liquidity providers supply the underlying outcome tokens to the market pool.
+
+The AMM follows a constant-product model:
+
+x × y = k
+
+Trading fees accrue to liquidity providers.
+
+The contracts also protect important invariants such as:
+
+No free-money trades
+No reserve draining
+Conservation during split/merge
+Correct rounding
+Correct fee accounting
+
+📈 Real-Time Market Charts
+
+Markets include price/probability charts to visualize how the market moved over time.
+
+The chart system is designed to support fast historical data retrieval through a database-backed indexing layer rather than repeatedly scanning the blockchain from the frontend.
+
+Architecture:
+
+Arc Blockchain
+      ↓
+Indexer
+      ↓
+Database
+      ↓
+Chart API
+      ↓
+Next.js Frontend
+
+This significantly reduces RPC work and improves chart loading performance.
 
 
-## Repo Structure
+🏗️ Architecture
+                    ┌─────────────────────┐
+                    │      Next.js UI     │
+                    │                     │
+                    │ Markets             │
+                    │ Trading             │
+                    │ Portfolio           │
+                    │ Profiles            │
+                    │ Leaderboard         │
+                    │ Admin               │
+                    └──────────┬──────────┘
+                               │
+                     wagmi / viem
+                               │
+                               ▼
+                    ┌─────────────────────┐
+                    │   Arc / Base L1     │
+                    │                     │
+                    │ MarketFactory       │
+                    │ ConditionalTokens   │
+                    │ FPMM                │
+                    │ MarketMetadata      │
+                    │ Social              │
+                    │ USDC                │
+                    └─────────────────────┘
+                               │
+                               ▼
+                    ┌─────────────────────┐
+                    │   Indexer / DB      │
+                    │                     │
+                    │ Trades              │
+                    │ Price history       │
+                    │ Market activity     │
+                    └─────────────────────┘
+🔐 Smart Contracts
 
-```
+The core contracts include:
+
+ConditionalTokens
+
+ERC-1155 based outcome shares.
+
+Supports:
+
+Split collateral into YES/NO
+Merge YES/NO back into collateral
+Redeem winning positions
+
+Example:
+
+100 USDC
+   ↓
+100 YES + 100 NO
+FixedProductMarketMaker
+
+Constant-product AMM used for market trading.
+
+MarketFactory
+
+Responsible for:
+
+Market creation
+Condition preparation
+FPMM deployment
+Market resolution
+Resolver permissions
+Resolution timing
+MarketMetadata
+
+Stores market:
+
+Description
+Image URL
+Metadata
+
+Metadata updates are owner-gated.
+
+Social
+
+Handles:
+
+Usernames
+Comments
+User activity
+
+
+📁 Repository Structure
 arc-prediction-market/
-├── contracts/           # Solidity + Hardhat
-│   ├── src/             # 6 contracts
-│   ├── test/            # 19 tests
-│   └── scripts/         # deploy.ts, e2e-local.ts
-├── frontend/            # Next.js app
-│   ├── app/             # pages (list, market detail, portfolio, admin)
-│   ├── components/      # Header, Footer, MarketCard, FeaturedSlider,
-│   │                    #   TradePanel, LiquidityForm, MarketImageUpload, ui
-│   ├── hooks/           # useMarkets, useMarket, useMarketImage, useHiddenMarkets
-│   ├── lib/             # chains, format (6-decimal USDC), sanitize, ABIs,
-│   │                    #   links, marketImages, hiddenMarkets
-│   ├── db/              # Database added to increase chart data loading speed
-└── README.md            # This file
-```
+│
+├── contracts/
+│   ├── src/
+│   │   ├── ConditionalTokens.sol
+│   │   ├── FixedProductMarketMaker.sol
+│   │   ├── MarketFactory.sol
+│   │   ├── MarketMetadata.sol
+│   │   ├── MockUSDC.sol
+│   │   └── Social.sol
+│   │
+│   ├── test/
+│   └── scripts/
+│
+├── frontend/
+│   ├── app/
+│   │   ├── markets
+│   │   ├── portfolio
+│   │   ├── profile
+│   │   └── admin
+│   │
+│   ├── components/
+│   ├── hooks/
+│   ├── lib/
+│   └── db/
+│
+├── docs/
+│
+├── package.json
+└── README.md
 
 ## License
 
