@@ -104,7 +104,7 @@ Markets include price/probability charts to visualize how the market moved over 
 
 The chart system is designed to support fast historical data retrieval through a database-backed indexing layer rather than repeatedly scanning the blockchain from the frontend.
 
-Architecture:
+**Architecture:**
 ```
 Arc Blockchain
       ↓
@@ -174,6 +174,7 @@ Example:
 100 USDC
    ↓
 100 YES + 100 NO
+
 **FixedProductMarketMaker**
 
 Constant-product AMM used for market trading.
@@ -188,6 +189,7 @@ FPMM deployment
 Market resolution
 Resolver permissions
 Resolution timing
+
 **MarketMetadata**
 
 Stores market:
