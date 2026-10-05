@@ -159,7 +159,7 @@ This significantly reduces RPC work and improves chart loading performance.
 
 The core contracts include:
 
-ConditionalTokens
+**ConditionalTokens**
 
 ERC-1155 based outcome shares.
 
@@ -174,11 +174,11 @@ Example:
 100 USDC
    ↓
 100 YES + 100 NO
-FixedProductMarketMaker
+**FixedProductMarketMaker**
 
 Constant-product AMM used for market trading.
 
-MarketFactory
+**MarketFactory**
 
 Responsible for:
 
@@ -188,7 +188,7 @@ FPMM deployment
 Market resolution
 Resolver permissions
 Resolution timing
-MarketMetadata
+**MarketMetadata**
 
 Stores market:
 
@@ -198,7 +198,7 @@ Metadata
 
 Metadata updates are owner-gated.
 
-Social
+**Social**
 
 Handles:
 
@@ -209,7 +209,7 @@ User activity
 
 📁 **Repository Structure**
 ```
-arc-prediction-market/
+0xoutcome/
 │
 ├── contracts/
 │   ├── src/
@@ -237,7 +237,6 @@ arc-prediction-market/
 │
 ├── docs/
 │
-├── package.json
 └── README.md
 ```
 ## License
